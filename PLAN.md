@@ -125,39 +125,62 @@ missing mapping does not fix this — the semantics are simply different.
 
 **Fix: a durable inbox, with callbacks demoted to wake-up signals.**
 
-- DynamoDB inbox keyed by `(sessionId, deliveryId)`; `deliver()` does a **conditional write** on `deliveryId` — that is also the delivery idempotency key, so client retries collapse naturally.
+- **Key: `(sessionId, seq)` — not `(sessionId, deliveryId)`.** `deliveryId` is an idempotency key with no ordering, but `bufferedDeliveries` (`session-delivery-hook.ts:43`) preserves **arrival order** today, and losing that is a user-visible semantic change. Allocate `seq` atomically with the same discipline gap 2 applies to the event log — `UpdateItem` `ADD` on a per-session counter, never read-then-write — and carry `deliveryId` as a separate attribute with a conditional write for idempotency.
 - After enqueuing, `deliver()` completes the current wake-up callback. A completion that loses a race is harmless: the message is already durable in the inbox.
-- The durable function **atomically drains** the inbox on wake, processes everything queued, then arms a fresh callback. This reproduces the buffer-and-coalesce behavior the iterator provides today.
+- **Drain protocol** ("atomically drains" is not a DynamoDB primitive, so specify it): `Query` the session partition above the last-processed `seq` in order; claim each item with a conditional update (or delete) so a replayed drain cannot double-process; record the high-water `seq` in the checkpoint. Items landing **mid-drain** are not swept into the current pass — they wake the next callback, which is what makes the protocol terminate.
 - The token index (`token → {callbackId, executionId, ttl}`) still exists, but only to find the *current* wake-up callback — losing the race to a stale one no longer loses a message.
 
 Use **`waitForCallback(name, submitter, config)`** rather than raw `createCallback()`: the
 submitter runs as an SDK-managed step, so persisting the mapping gets retry semantics for
 free instead of hand-rolled.
 
+**Not every token needs the inbox.** Disposition each family explicitly, because the inbox
+is the expensive option:
+
+| Token family | Semantics | Mapping |
+|---|---|---|
+| Session delivery (`<completionToken>:inbox`) | reusable, multi-message, ordered | durable inbox (above) |
+| `{sessionId}:cancel` | single-shot | plain callback (gap 3) |
+| Connection-OAuth callback | single-shot per authorization | plain callback — 1:1, no inbox |
+| HITL / approval completion | single-shot per request | plain callback — 1:1, no inbox |
+
+Only the delivery hook is genuinely reusable. The others map directly onto a single AWS
+callback, which is cheaper and simpler; the plan should not imply every `resumeHook` path
+routes through the inbox.
+
+**The token index needs two lifetimes.** `Runtime.resolveSession(continuationToken)`
+(`workflow-runtime.ts:229`) resolves token → sessionId via `getHookByToken`, and it must
+work **for the session's whole life** — including long-idle periods when no callback is
+armed. A `ttl` scoped to the current callback would break it. Use two records (or two
+tables): a session-lifetime `token → sessionId` mapping, and a short-lived
+`token → {callbackId, executionId}` mapping for the currently armed callback.
+
 **Residual race:** `deliver()` can still arrive before the first mapping is checkpointed.
 With the inbox this degrades gracefully — the write lands, and the execution drains it on
 its next wake — but `resumeHook` should still back off and retry rather than 404 when no
 callback is armed yet.
 
-### 2. No run streams — and they are the session *persistence substrate*, not just a tail
-This is bigger than it first looks. Workflow streams serve two distinct jobs:
+### 2. No run streams — the client tail needs an event log
+Workflow streams serve two jobs, and only one of them is load-bearing:
 
-- **Client tail** — NDJSON events, `getRun(id).getReadable({ startIndex })` (`workflow-runtime.ts:224`), written by `getWritable()` (`workflow-entry.ts:89`).
-- **Session persistence** — `readDurableSession` (`durable-session-store.ts:138`) reads the snapshot back off a *namespaced* stream: `getReadable({ namespace: EVE_SESSION_STREAM_NAMESPACE, startIndex: -1 })`.
+- **Client tail** — NDJSON events, `getRun(id).getReadable({ startIndex })` (`workflow-runtime.ts:224`), written by `getWritable()` (`workflow-entry.ts:89`). This is the real dependency.
+- **Legacy session read** — `readDurableSession` (`durable-session-store.ts:135`) returns `state.snapshot` inline when present and only tails the namespaced `eve.session` stream for **states written before snapshots moved inline**. The code says so directly: *"New states carry the snapshot directly through Workflow step results. States without `snapshot` fall back to the legacy `eve.session` stream tail."*
 
-So `durable-session-store.ts` **cannot be kept as-is** (an earlier draft of this plan said
-it could). Two things must be true before Phase 1 can close:
+A prior revision of this plan claimed the store "cannot be kept as-is" because its read path
+went through a stream. **That was an overcorrection.** New sessions already carry the
+snapshot through step results; under this repo's pre-1.0 no-legacy-fallback rule the stream
+branch is simply deleted, and `durable-session-store.ts` largely survives.
 
-**Fix A — session snapshots get their own home.** Move them to DynamoDB (pointer) + S3
-(body) rather than a stream namespace. This makes the S3 snapshot offload in open-risk #1
-a **Phase 1 requirement, not a later optimization** — it is also the answer to checkpoint
-payload cost.
+**Fix A — move snapshots to DynamoDB + S3 anyway, but for the right reason.** The
+justification is **checkpoint payload size and cost**, not streams disappearing: eve
+checkpoints a full session snapshot per step, metering bills per-operation *and*
+per-payload-byte, and DynamoDB items cap at 400 KB. Whether this is Phase 1 or later
+depends on spike 2's measurement — argue it from payload economics, not from a
+non-existent read-path break.
 
-**Fix B — the client tail becomes an event log.** Append-only DynamoDB `(sessionId, seq)`;
-the HTTP Lambda long-polls it. The client protocol **already** carries `?startIndex=` for
-resumable reconnect (`src/client/open-stream.ts`), so poll-tailing is a drop-in — no client
-or wire-format change. Keep it behind a narrow interface so Kinesis/AppSync
-Events/Momento can replace it later.
+**Fix B — the client tail becomes an event log.** This one *is* unavoidable. Append-only
+DynamoDB, long-polled by the HTTP Lambda. Keep it behind a narrow interface so
+Kinesis/AppSync Events/Momento can replace it later.
 
 **Appends must be idempotent under replay *and* safe under concurrency.** Tail events are
 written *mid-step*, token-by-token during a model call. A step that appends and then
@@ -226,8 +249,9 @@ were on Vercel.
 
 ### 6. `waitUntil` — a public API semantic to decide once
 `waitUntil` is **not** an internal detail. It sits on the public `ChannelRouteContext`
-(`src/channel/routes.ts:40`) and is used by **nine built-in channels** — Slack, Discord,
-Telegram, Teams, Twilio, GitHub, Linear, chat-sdk — plus `schedule-task.ts` and
+(`src/channel/routes.ts:40`) and is used by **eight built-in channels** — Slack, Discord,
+Telegram, Teams, Twilio, GitHub, Linear, chat-sdk (across nine files; Slack uses it in both
+`slackChannel.ts` and `interactions.ts`) — plus `schedule-task.ts` and
 `channel-dispatch.ts`. The Slack docs explicitly promise `ctx.waitUntil(...)` for detached
 work. Any authored channel may use it.
 
@@ -252,6 +276,13 @@ sizing analysis built on that number was wrong. Note the pricing edge: payloads 
 limit one. `start()` carries serialized context including the bundle source descriptor and
 the initial delivery payload — use the same S3 pointer mechanism Fix A introduces for
 snapshots, with a size check at the boundary.
+
+**One offload rule, applied at every DynamoDB write boundary.** DynamoDB items cap at
+**400 KB**, and three write paths carry user-controlled content, not just `start()`:
+inbox deliveries (arbitrary message content and attachments), event-log appends (tool
+results can be large), and snapshots. Specify a single size-check-and-offload helper —
+inline below the threshold, S3 pointer above it — and route every write through it.
+Handling only `start()` leaves two live failure paths.
 
 **Starts need an idempotency key too.** Async invocation plus client retries will otherwise
 open duplicate durable sessions for one logical session. Lambda provides
@@ -306,6 +337,19 @@ workflow stream, which has no AWS equivalent (gap 2, Fix A). Delete
 — the World concept disappears entirely, along with `experimental.workflow.world`
 (`src/shared/agent-definition.ts:230`, public experimental surface → `minor` changeset) and
 `resolveWorkflowWorldWiring()` (`src/internal/application/compiled-artifacts.ts:264`).
+
+**`@workflow/serde` needs a named owner, or replay will mangle types.** The plan keeps the
+snapshot *format*, but the snapshot is encoded by devalue via the Workflow serde layer —
+`durable-session-store.ts` documents it explicitly: *"Devalue handles encode/decode so rich
+types in the session (URL `FilePart.data`, Buffer, Date, Map, Set) round-trip
+structurally."* The AWS SDK brings its own serialization with different fidelity, and a
+`Date` or `Map` that silently degrades to a plain object on checkpoint round-trip is
+exactly the kind of bug that surfaces only under replay, days later. Decide now: either
+vendor the devalue encoding as eve-owned code and pass opaque strings through the AWS SDK,
+or supply per-operation `serdes` (the SDK's callback config already accepts one) and prove
+the round-trip with a type-fidelity test. `@workflow/errors` and `@workflow/utils` need the
+same call — their error shapes feed `harness/workflow-stream-error.ts` and
+`semantic-errors/rules/workflow.ts`.
 
 Vendor **both** `@aws/durable-execution-sdk-js` and `@aws/durable-execution-sdk-js-testing`
 through the existing mechanism (`packages/eve/scripts/vendor-compiled/index.mjs`, one
@@ -526,7 +570,8 @@ Rename: `@vercel/eve-catalog` workspace package, `ghcr.io/vercel/eve` image, the
 and the `@vercel/connect` scaffolding in `src/setup/scaffold/**`.
 
 ### Touchpoints easy to miss
-**229 non-test source files** mention Vercel. The inventory above covers the load-bearing
+**229 non-test source files** mention Vercel (`grep -rli vercel src --include='*.ts'`, minus
+`*.test.ts`). The inventory above covers the load-bearing
 majority; these three clusters are easy to overlook and each needs an explicit disposition:
 
 - **The TUI remote-attach flow** — `src/services/dev-client/{vercel-auth-error,request-headers,credential-gate}.ts` plus `src/cli/dev/tui/{remote-auth*,remote-connection*,vercel-status,vercel-trusted-sources*}.ts`. The whole "attach the local TUI to a deployed agent" experience authenticates against a Vercel project. It needs an AWS story (SigV4 from the local credential chain is the obvious one) or explicit removal — do not let it rot half-ported.
@@ -547,30 +592,43 @@ under `e2e/fixtures/` deployed behind one Function URL each and torn down after.
 **Phase 0 — De-Vercel without changing behavior.** *Mergeable, but local-dev-only.*
 Delete `eve deploy`/`eve link`, the `src/setup/` Vercel surface, the framework
 `vercel-*` output writers, `vercel-agent-summary`, and the `@vercel/*` deps.
-Switch the Nitro preset to `aws-lambda`. Pin the sandbox to Docker and the workflow
-world to `@workflow/world-local` so the tree stays green. Rebrand.
-This is mostly deletion and lands fast — it makes every later phase smaller.
+Pin the sandbox to Docker and the workflow world to `@workflow/world-local` so the tree
+stays green. Rebrand. This is mostly deletion and lands fast — it makes every later phase
+smaller.
+
+**Order the preset switch deliberately.** `aws-lambda` preset + still-Vercel-shaped workflow
+output is an untested combination that may not build at all. Either make that build check
+the **first task of Phase 0**, gating everything after it, or defer the switch into Phase 1
+where the workflow emitter is replaced anyway. Scheduling it mid-phase — as an earlier
+draft did — risks discovering the incompatibility with half the deletions already landed
+and no clean way back.
 
 Be honest about what it costs: **after Phase 0 there is no production deployment path at
 all** until Phases 1 and 4 land — the deploy CLI is gone, Vercel output emission is gone,
 and the AWS runtime does not exist yet. That is acceptable for a hard fork, but it is not
-"independently shippable" in the usual sense. Also verify early that the tree actually
-builds with the preset switched to `aws-lambda` while the workflow bundle still emits
-Vercel-shaped output — that combination is untested and may not survive contact.
+"independently shippable" in the usual sense.
 
 **Phase 1 — Durable execution on Lambda. *The long pole.***
 Vendor `@aws/durable-execution-sdk-js`.
 
-**Two earlier spikes are already resolved by documentation — do not re-budget them:**
+**One earlier spike is closed by documentation:** `LocalDurableTestRunner` *can* start an
+execution without awaiting it — the testing docs show `runner.run()` retained as a promise
+while callbacks complete concurrently. The local-dev story stands.
 
-- ~~Can `LocalDurableTestRunner` start an execution without awaiting it?~~ **Yes.** The testing docs show `runner.run()` retained as a promise while callbacks are completed concurrently. The local-dev story stands.
-- ~~Does the pinned Nitro support response streaming?~~ **Yes.** The `aws-lambda` preset ships `aws-lambda-streaming.mjs` over `awslambda.streamifyResponse`, enabled by `awsLambda: { streaming: true }`.
-
-**Three real unknowns remain:**
+**Four unknowns remain:**
 
 1. Can a callback be **raced against an in-flight step**, and what happens to the losing branch on replay? Gates *turn* cancel only — session terminate has `StopDurableExecution` behind it.
-2. What does a full session snapshot cost per step in checkpoint bytes? Gates how aggressive the S3 offload threshold must be.
-3. **How is the stream attempt id allocated?** `StepContext` does not expose the retry attempt, so the generation-aware cursor (gap 2) needs an eve-owned scheme. This one is on the critical path for the client protocol change.
+2. **What does the parent observe when a per-turn child execution is stopped mid-flight?** The per-turn `context.invoke` design makes `StopDurableExecution` turn-granular, but the driver's checkpointed `invoke` operation sees *something* when its child is stopped — an error result, presumably. If the SDK retries a failed child invocation it would **resurrect a cancelled turn**, which is worse than not cancelling. Same feature as unknown 1; spike them together.
+3. What does a full session snapshot cost per step in checkpoint bytes? Gates how aggressive the S3 offload threshold must be, and now carries Fix A's whole justification.
+4. **How is the stream attempt id allocated?** `StepContext` does not expose the retry attempt, so the generation-aware cursor (gap 2) needs an eve-owned scheme. On the critical path for the client protocol change.
+
+**Plus one cheap smoke test, deliberately not struck off.** The Nitro docs say the
+`aws-lambda` preset supports `awsLambda: { streaming: true }` over
+`awslambda.streamifyResponse`, and that is almost certainly right — but gap 6's entire
+`waitUntil` design rests on the handler continuing to execute *after* the response stream
+closes, which no doc actually promises. Half a day deploying a trivial streaming handler to
+a real Function URL and asserting post-close execution is cheap insurance against building
+a public API semantic on an assumption.
 
 Then define the `DurableBackend` seam and land the **`local` backend first** — it keeps
 `eve dev` and the test tiers working throughout the rewrite, and it is the cheapest place
@@ -615,14 +673,19 @@ e2e workflow.
 ## Verification
 
 - **Phase 0:** `pnpm build && pnpm typecheck && pnpm test` all green; `pnpm guard:invariants` passes; `grep -ri vercel packages/eve/src` returns only intentional leftovers.
-- **Phase 1:** the tightest signal is `LocalDurableTestRunner`-backed integration tests over `workflow-runtime.ts`'s `Runtime` interface — start a session, deliver a message, tail NDJSON with `startIndex`, cancel a turn, resume after a simulated interruption. Then `eve dev` end-to-end against the weather fixture (`apps/fixtures/weather-fixture`), driving a real multi-turn conversation and confirming events stream and a HITL approval round-trips.
+- **Phase 1:** the tightest signal is `LocalDurableTestRunner`-backed integration tests over `workflow-runtime.ts`'s `Runtime` interface — start a session, deliver a message, tail the event log, cancel a turn, resume after a simulated interruption. Three cases the new design specifically exists for, and which a naive test list misses:
+  - **Force a step retry mid-stream** and assert the client discards superseded events and follows the new attempt. (Testing with a plain integer `startIndex` would assert the behavior gap 2 declares insufficient.)
+  - **Two concurrent deliveries**, asserting both are processed in arrival order and neither is lost — the failure the durable inbox exists to prevent.
+  - **A type-fidelity round-trip** over the snapshot (`Date`, `Map`, `Set`, `Buffer`, URL `FilePart.data`) to catch serde degradation.
+
+  Then `eve dev` end-to-end against the weather fixture (`apps/fixtures/weather-fixture`), driving a real multi-turn conversation and confirming events stream and a HITL approval round-trips.
 - **Phase 2:** run an agent against a real Bedrock model id; confirm the compiled manifest carries correct context-window limits and that compaction triggers at the right threshold.
 - **Phase 3:** `e2e/fixtures/agent-tools-sandbox` locally against Docker, then a deployed MicroVM: create a session, write a file, let it idle into suspend, resume **within the 8-hour cap**, confirm the file survived. Then the case that actually matters — force expiry past the cap and confirm **cold rehydrate** recreates the sandbox and re-seeds files rather than erroring.
 - **Phase 4/5:** deploy the CDK stack to a test account and run `eve eval` against the Function URL — the same shape as today's `e2e-vercel.yml`, different target.
 
 ## Open risks
 
-1. **Durable-function payload/checkpoint costs.** eve checkpoints a full session snapshot per step (`durable-session-store.ts`). Metering is per-operation *and* per-payload-byte; large snapshots in a long session get expensive fast. Since snapshots must move off stream namespaces anyway (gap 2, Fix A), **S3 offload with only a pointer checkpointed is now a Phase 1 requirement**, not a contingency. Measure in spike 4.
+1. **Durable-function payload/checkpoint costs.** eve checkpoints a full session snapshot per step (`durable-session-store.ts`). Metering is per-operation *and* per-payload-byte, and DynamoDB items cap at 400 KB, so large snapshots in a long session get expensive fast. This is now the **sole** justification for the S3 offload (gap 2, Fix A) — spike 3 measures it and decides whether it lands in Phase 1 or later. Do not treat it as settled in either direction before that measurement.
 2. **Replay determinism.** eve's step bodies do model calls, tool calls, and clock reads. Everything non-deterministic must sit inside `context.step()`. `src/harness/tool-loop.ts` (~2,400 lines) is the file to audit hardest.
 3. **Concurrent callback completion.** eve's turn-inbox hook can receive multiple deliveries; AWS callbacks appear to be single-completion. The inbox may need one callback per delivery rather than a reusable hook.
 4. **MicroVM API maturity.** It is new; confirm the JS SDK surface, per-account MicroVM quotas, and image build times before committing Phase 3's schedule.

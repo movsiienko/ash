@@ -24,31 +24,52 @@ This document is the "what needs to change" assessment plus an execution order.
 > Workflow directives are reserved for eve-generated workflow entrypoints.
 
 Confirmed by grep: zero occurrences of either directive anywhere in `apps/`, `e2e/`,
-or `docs/`. **The durable-execution layer is 100% framework-internal.** Swapping
-`@workflow/core` for the AWS SDK is a pure internal refactor with **no authoring-API
-break** — agent directories, tools, channels, skills, and schedules are untouched.
+or `docs/`. **The durable-execution layer is effectively framework-internal.** Swapping
+`@workflow/core` for the AWS SDK touches no agent directory, tool, channel, skill, or
+schedule. The one exception: `experimental.workflow.world`
+(`src/shared/agent-definition.ts:230`) is a public — if experimental — authoring surface,
+and deleting it *is* a technical authoring-API break. Per repo rules that warrants a
+`minor` changeset. It is the only one.
 
 The corollary is better than a port: most of `src/internal/workflow-bundle/`
-(~2,000+ lines) exists *only* to synthesize durable entrypoints out of directive-marked
-module-scope functions. AWS's `context.step(name, fn)` takes an inline closure and
-needs no stable module identity, so that machinery gets **deleted, not ported**:
+(**4,236 non-test lines**) exists *only* to synthesize durable entrypoints out of
+directive-marked module-scope functions. AWS's `context.step(name, fn)` takes an inline
+closure and needs no stable module identity, so that machinery gets **deleted, not ported**:
 
 | File | Why it exists today | Fate |
 |---|---|---|
 | `workflow-transformer.ts` | strips/parses `"use workflow"`/`"use step"` | delete |
-| `workflow-core-shim.ts` | bridges workflow bodies to runtime via `Symbol.for("WORKFLOW_*")` globals | delete |
+| `workflow-core-shim.ts` (181) | bridges workflow bodies to runtime via `Symbol.for("WORKFLOW_*")` globals | delete |
 | `dynamic-tool-transform.ts` + `dynamic-tool-ast-references.ts` | hoists tool `execute` to module scope so it can be a step | delete |
-| `builder.ts` (687 lines) + `builder-support.ts` | rolldown bundle of transformed workflow bodies | delete |
-| `vercel-workflow-output.ts` (657 lines) | emits one `.func` per workflow into `.vercel/output` | replace with a single durable-handler entry |
+| `builder.ts` (687) + `builder-support.ts` | rolldown bundle of transformed workflow bodies | delete |
+| `workflow-builders.ts` (443) | `applyWorkflowTransform`, `createEveWorkflowQueueTrigger()` (`queue/v2beta`) | delete; queue triggers have no AWS analogue |
+| `nitro-step-entry.ts` (210) | hosted step entrypoint for the Vercel step function | replace with the durable-handler entry |
+| `eve-service-route-output.ts` (61) | `eve/__server.func` + `.well-known/workflow/` route prefixes | delete with the Build Output emitter |
+| `vercel-workflow-output.ts` (657) | emits one `.func` per workflow into `.vercel/output` | replace with a single durable-handler entry |
 | `authored-directive-prologue.ts` | guards the above | delete |
 
-Replacing the workflow SDK is therefore a net **simplification**, not just a swap.
+This is a net **simplification**, and it is the strongest argument that the user's
+instinct here is right.
+
+**But do not delete the naming machinery without replacing what it guaranteed.** The
+claim above — "no stable module identity required" — is true of *module* identity and
+false of *operation* identity. Replay works by matching each durable operation against the
+checkpoint log; the AWS SDK derives that match from **invocation order within the
+execution**, so any code path that changes the order or count of operations between the
+original run and a replay produces divergence. Today the transform gave every step a
+source-derived, stable name for free. After deletion, eve owns that contract.
+
+Concretely, before `builder.ts` and `workflow-builders.ts` are removed, fix and document:
+
+- **A stable naming scheme** for every `context.step` / `createCallback` / `runInChildContext` / `parallel` / `map` — derived from source location or a compiled-manifest identifier, not from a runtime value.
+- **Ordering invariants for conditional and loop paths.** eve's turn loop iterates tool calls; the number of steps per turn depends on model output. That is fine *within* one execution, but any branch keyed on non-checkpointed state (wall clock, env, cache hits) will reorder operations on replay. This is the concrete form of open-risk #2.
+- **A determinism test** in the integration tier: run a session, force a replay, assert the operation sequence is identical. This is the only cheap way to catch regressions here, and it should land with the first `DurableContext` rewrite rather than after.
 
 ---
 
 ## Target architecture
 
-```
+```text
 EventBridge Scheduler ──┐
                         ▼
 Client ── Function URL ─► HTTP Lambda (Nitro, aws-lambda preset)
@@ -70,7 +91,7 @@ Two Lambda bundles from one compiled artifact set, instead of Vercel's N-functio
 
 The AWS SDK covers most of what eve needs (`step`, `wait`, `waitForCondition`,
 `createCallback`/`waitForCallback`, `invoke`, `parallel`, `map`, `runInChildContext`,
-1-year executions, free waits). Four things it does **not** give you:
+1-year executions, free waits). Six things it does **not** give you:
 
 ### 1. Hook tokens vs. AWS-generated callback IDs — needs an index table
 eve mints its own hook tokens (`"<completionToken>:inbox"`, `"<sessionId>:cancel"`,
@@ -85,20 +106,61 @@ The durable function writes the mapping inside a step immediately after `createC
 within `src/execution/hook-ownership.ts` and `session-delivery-hook.ts`, whose interfaces
 already isolate this.
 
-### 2. No per-run event stream — needs an event log
-eve's NDJSON tail is `getRun(id).getReadable({ startIndex })`
-(`workflow-runtime.ts:224`, `durable-session-store.ts:138`), written by `getWritable()`
-(`workflow-entry.ts:89`). Durable functions have no equivalent.
+**Race to handle:** `deliver()` can arrive over HTTP *before* the durable function has
+checkpointed the mapping — a fast follow-up message right after session start is enough.
+`resumeHook` needs an explicit park/retry-with-backoff policy on a missing token rather
+than a 404. This compounds open-risk #3: if single-completion callbacks force
+one-callback-per-delivery, the mapping churns every turn while the client keeps presenting
+the same stable eve token, so the index is written on the hot path and the race recurs
+per turn rather than once per session.
 
-**Fix:** append-only DynamoDB event log `(sessionId, seq)`; the HTTP Lambda long-polls it.
-The client protocol **already** carries `?startIndex=` for resumable reconnect
-(`src/client/open-stream.ts`), so poll-tailing is a drop-in — no client or wire-format change.
-Keep it behind a narrow interface so Kinesis/AppSync Events/Momento can replace it later.
+### 2. No run streams — and they are the session *persistence substrate*, not just a tail
+This is bigger than it first looks. Workflow streams serve two distinct jobs:
 
-### 3. No documented stop API — use a cancel callback
+- **Client tail** — NDJSON events, `getRun(id).getReadable({ startIndex })` (`workflow-runtime.ts:224`), written by `getWritable()` (`workflow-entry.ts:89`).
+- **Session persistence** — `readDurableSession` (`durable-session-store.ts:138`) reads the snapshot back off a *namespaced* stream: `getReadable({ namespace: EVE_SESSION_STREAM_NAMESPACE, startIndex: -1 })`.
+
+So `durable-session-store.ts` **cannot be kept as-is** (an earlier draft of this plan said
+it could). Two things must be true before Phase 1 can close:
+
+**Fix A — session snapshots get their own home.** Move them to DynamoDB (pointer) + S3
+(body) rather than a stream namespace. This makes the S3 snapshot offload in open-risk #1
+a **Phase 1 requirement, not a later optimization** — it is also the answer to checkpoint
+payload cost.
+
+**Fix B — the client tail becomes an event log.** Append-only DynamoDB `(sessionId, seq)`;
+the HTTP Lambda long-polls it. The client protocol **already** carries `?startIndex=` for
+resumable reconnect (`src/client/open-stream.ts`), so poll-tailing is a drop-in — no client
+or wire-format change. Keep it behind a narrow interface so Kinesis/AppSync
+Events/Momento can replace it later.
+
+**Appends must be idempotent under replay *and* safe under concurrency.** Tail events are
+written *mid-step*, token-by-token during a model call. A step that appends and then
+crashes before checkpointing will re-run and append again — and a retried model call
+streams *different* tokens, so this is divergence, not just duplication. Vercel's platform
+owned this; eve now owns it. A naive append-with-counter **breaks under replay**, and a
+read-then-increment counter also races when a parent execution and a child session write
+concurrently.
+
+The design must nail down four things, not just pick a scheme:
+
+1. **Sequence allocation is atomic.** Either a DynamoDB `UpdateItem` `ADD` on a per-session counter item, or a conditional `PutItem` on `attribute_not_exists(seq)` with retry on collision. Never read-then-write.
+2. **Attempt-scoped keys.** `(sessionId, attempt, seq)`, with the tail following the highest attempt. Preferred over truncate-on-retry: it is a single conditional write, and it preserves superseded attempts for debugging replay divergence — exactly the failure this design is most likely to hit.
+3. **An explicit idempotency key** on every append — `(sessionId, attempt, seq)` is sufficient and lets a retried write be a no-op rather than a duplicate.
+4. **Defined client behavior.** On an attempt rollover the client sees a sequence discontinuity; it must reset to the new attempt's `startIndex` rather than treating the gap as loss. Duplicate `(attempt, seq)` pairs are dropped client-side. This is additive to the existing `?startIndex=` protocol — the wire format does not change, but `src/client/message-reducer.ts` needs the dedupe and rollover rules.
+
+### 3. No documented stop API — use a cancel callback, but it is not a full replacement
 `cancelRun` has no direct equivalent. eve already has a dedicated `{sessionId}:cancel`
-hook (`src/execution/turn-cancellation-control.ts`); make cancellation purely a
-callback completion the turn races against. Cheaper than it sounds.
+hook (`src/execution/turn-cancellation-control.ts`); make cancellation a callback
+completion the turn races against.
+
+**Two unknowns that belong on the Phase 1 spike list**, because both are undocumented:
+whether the SDK supports *racing a callback against an in-flight step* at all, and what
+happens to the losing branch on replay. And the approach is structurally incomplete — an
+execution wedged before it reaches the race point is **unkillable**, since there is no stop
+API to fall back on. `terminateSession()` inherits the same hole. If racing turns out
+unsupported, the fallback is a cancellation flag checked at every step boundary, which
+bounds worst-case cancellation latency to one step rather than making it immediate.
 
 ### 4. Lambda is request-scoped — long-lived-process assumptions break
 Audit these; each currently assumes a process that outlives a request:
@@ -106,8 +168,30 @@ Audit these; each currently assumes a process that outlives a request:
 - **Nitro `scheduledTasks`** (`src/internal/nitro/host/schedule-task-routes.ts`) — the in-process cron scheduler cannot run on Lambda. → EventBridge Scheduler (below).
 - **`event.waitUntil()`** (`src/internal/nitro/routes/channel-dispatch.ts`) — post-ack work is drained before the Lambda freezes. Slack-style "ack fast, work after" must instead async-invoke the durable function. This is a behavioral change worth calling out in docs.
 - **Per-session MCP connection registry** (`src/runtime/connections/registry.ts`) — already per-session and `dispose()`d, so it is fine, but it now reconnects per step rather than per process. Watch OAuth token cache churn in `scoped-authorization.ts`.
-- **Sandbox `shutdown()`** — must become *suspend*, not terminate (see below).
+- **Sandbox `shutdown()`** — must become *suspend*, not terminate, and **nothing currently triggers it** (see below).
 - **NDJSON response streaming** caps at the Lambda 15-minute limit; client reconnect with `startIndex` covers longer sessions.
+
+### 5. Response streaming mode — a decision, not just a cap
+Lambda Function URLs default to **`BUFFERED`**, which returns the response only once the
+handler finishes. Under that mode the NDJSON tail delivers *nothing incrementally* and the
+streaming UX is silently dead. Incremental delivery requires `RESPONSE_STREAM` invoke mode
+**and** Nitro `aws-lambda` support for `streamifyResponse`. Whether the pinned
+`nitro@3.0.260610-beta` supports this is **unverified** — put it on the Phase 1 spike list
+next to the runner spike; if it does not, the workaround is a separate streaming-only
+function entry or client-side polling.
+
+Cost consequence worth pricing before committing: under `RESPONSE_STREAM`, **every
+connected tail client pins one HTTP-Lambda concurrent execution for up to 15 minutes**
+while long-polling DynamoDB. Idle sessions with an open stream are not free the way they
+were on Vercel.
+
+### 6. Payload ceilings
+Async `Invoke` — the session-start path — caps at **256 KB**, versus 6 MB for sync.
+`start()` today carries serialized context including the bundle source descriptor and the
+initial delivery payload, so this is a live constraint, not a theoretical one.
+Callback-completion payloads (deliveries carrying attachments) have their own limits.
+Needs an S3-offload convention with a size check at the boundary — the same S3 pointer
+mechanism Fix A above introduces for snapshots.
 
 ---
 
@@ -128,17 +212,22 @@ written against it and should not change — but its implementation swaps:
 | `cancelRun(id)` | complete the cancel callback |
 | `shouldRouteToLatestDeployment()` (`VERCEL_ENV`) | Lambda alias routing — delete the function |
 
-Keep `durable-session-store.ts` and `durable-session-migrations/` — the snapshot format
-is platform-neutral and the versioning is worth preserving. Delete
+Keep the **snapshot format** and `durable-session-migrations/` — both are platform-neutral
+and the versioning is worth preserving. But `durable-session-store.ts` itself must be
+**rewritten**, not kept: its read path (`:138`) pulls the snapshot off a namespaced
+workflow stream, which has no AWS equivalent (gap 2, Fix A). Delete
 `workflow-callback-url.ts` (Vercel protection-bypass) and
 `src/internal/workflow/{validate-world,world-compatibility,local-world-data-directory,development-world-*}.ts`
 — the World concept disappears entirely, along with `experimental.workflow.world`
-in `agent.ts` and `resolveWorkflowWorldWiring()` in
-`src/internal/application/compiled-artifacts.ts:246-345`.
+(`src/shared/agent-definition.ts:230`, public experimental surface → `minor` changeset) and
+`resolveWorkflowWorldWiring()` (`src/internal/application/compiled-artifacts.ts:264`).
 
-Vendor `@aws/durable-execution-sdk-js` through the existing mechanism
-(`packages/eve/scripts/vendor-compiled/index.mjs`) so the "one runtime dependency"
-invariant holds.
+Vendor **both** `@aws/durable-execution-sdk-js` and `@aws/durable-execution-sdk-js-testing`
+through the existing mechanism (`packages/eve/scripts/vendor-compiled/index.mjs`, one
+per-package file each) so the "one runtime dependency" invariant holds. The testing SDK is
+not optional here despite its name — the `local` `DurableBackend` is built on
+`LocalDurableTestRunner` and ships as part of `eve dev`, so it must be vendored like any
+other runtime dependency rather than left a `devDependency`.
 
 ### Local development — introduce a `DurableBackend` seam
 
@@ -180,9 +269,10 @@ disk-backed checkpoint log. The seam makes that a contained swap rather than a r
 which is the main reason to introduce it.
 
 ### HTTP host — `packages/eve/src/internal/nitro/host/`
-`resolveProductionNitroPreset()` (`create-application-nitro.ts:84`) returns
-`"aws-lambda"` unconditionally. Build emits two entries: the Nitro handler and the
-durable handler. Replace `vercel-build-output-config.ts` / `build-vercel-agent-summary.ts`
+`resolveProductionNitroPreset()` (`create-application-nitro.ts:84`) currently returns
+`"vercel" | undefined`; change it to return `"aws-lambda"` unconditionally and drop the
+`process.env.VERCEL` probe. Build emits two entries: the Nitro handler and the
+durable handler. Function URL invoke mode must be `RESPONSE_STREAM` (gap 5). Replace `vercel-build-output-config.ts` / `build-vercel-agent-summary.ts`
 with a **deploy manifest** (`.eve/aws-manifest.json`: function entries, cron expressions,
 env requirements, table names, MicroVM image ids) — this is the CDK contract and is the
 natural successor to the Vercel dashboard summary. Delete `cron-handler-route.ts`,
@@ -196,11 +286,28 @@ not an API key. Delete `src/internal/gateway.ts`, `src/internal/runtime-model.ts
 (`src/setup/{ai-gateway-api-key,validate-gateway-key,gateway-models}.ts`,
 `src/setup/boxes/{detect-ai-gateway,apply-ai-gateway-credential}.ts`); `WiringMode`
 in `src/setup/state.ts:101` collapses to a single mode.
-`DEFAULT_AGENT_MODEL_ID` → a Bedrock inference-profile id (`us.anthropic.claude-sonnet-5-*`).
+`DEFAULT_AGENT_MODEL_ID` → a **concrete** Bedrock inference-profile id, not a wildcard.
+Recommended: `us.anthropic.claude-sonnet-5`. That prefix is a deliberate choice with
+consequences to document at the same time — `us.` is a *cross-Region* inference profile
+that may route requests to any US region, which is a data-residency decision, not just a
+routing detail. It also changes the IAM shape: the execution role needs
+`bedrock:InvokeModel` / `InvokeModelWithResponseStream` on the inference-profile ARN **and**
+on the underlying foundation-model ARNs in every region the profile can reach. Deployments
+with residency constraints should override to a single-region profile
+(`arn:aws:bedrock:<region>:<account>:inference-profile/...`) via `agent.ts`.
 **`src/compiler/model-catalog.ts` needs a decision**: it fetches the Gateway catalog at
 build time to bake `contextWindowTokens`/`maxOutputTokens` into the manifest. Bedrock's
 `ListFoundationModels` does not reliably expose context windows — bake a static catalog
 and let `agent.ts` override.
+
+**Bedrock-as-default partly contradicts the credential-free local story.** The `local`
+durable backend needs no AWS credentials, but a Bedrock default means `eve dev` and local
+e2e need them for *every model call* — so "no AWS account required" is only true of the
+durable layer, not of running an agent. Resolve it explicitly: `@ai-sdk/anthropic` and
+`@ai-sdk/openai` are **already vendored**, so keep direct API-key providers as the
+first-class local path, and state what bare-string resolution does off-Lambda (recommended:
+resolve to Bedrock only when AWS credentials are present, otherwise require an explicit
+provider-qualified id and fail with a clear message rather than an opaque credential error).
 
 ### Sandbox — Lambda MicroVM
 Maps cleanly onto the existing `SandboxBackend` interface
@@ -213,10 +320,32 @@ Maps cleanly onto the existing `SandboxBackend` interface
 | `captureState()` | `{ microVmId, endpoint }` |
 | `shutdown()` | **`suspend-microvm`**, not terminate — memory+disk preserved, sessions reattach |
 
-**The one real gap:** `@vercel/sandbox` gave a command SDK (`runCommand`/`readFile`/`writeFile`);
+**Nothing triggers `shutdown()` on Lambda.** Today suspension rides on
+`src/internal/nitro/host/sandbox-shutdown-plugin.ts`, which hooks `SIGINT`/`SIGTERM` and
+Nitro close — none of which fire reliably on Lambda. The execution environment simply
+freezes and the sandbox dies silently, leaking a running MicroVM. Suspend needs an
+explicit trigger; pick one in Phase 3 rather than discovering it in production:
+**suspend-at-turn-end** (simplest, from the durable function itself), an EventBridge
+sweeper over a DynamoDB lease table, or MicroVM idle lifecycle policies doing the work
+natively. The last is the most attractive if the policy granularity fits, since it removes
+eve from the loop entirely.
+
+**The other real gap:** `@vercel/sandbox` gave a command SDK (`runCommand`/`readFile`/`writeFile`);
 MicroVM gives you a raw HTTPS endpoint with JWE auth. eve must ship a small **in-image
 agent server** implementing the `SandboxSession` surface, baked into the image the root
 `Dockerfile` produces. Budget real time for this; it is the sandbox long pole.
+
+**Settle the credential and tenant-isolation contract before any endpoint metadata is
+persisted.** This is security-critical and easy to get wrong, because `captureState()`
+writes reconnect metadata into durable session state that outlives the process, and
+`create()` reattaches suspended sessions from it. A sandbox executes model-generated code,
+so a token that leaks or over-scopes is a direct cross-tenant code-execution path. Specify:
+
+- **Where JWE tokens are minted and stored.** Mint in the app runtime, never inside the sandbox. Persist a *reference* in session state, not the token itself — the same rule `src/runtime/connections/scoped-authorization.ts` already applies to connection tokens.
+- **What each token binds to** — account, function, session id, and the single permitted port. A token valid for any session in the account is not acceptable.
+- **Expiry and rotation.** Sessions can idle for days across suspend/resume, so tokens will outlive their validity; the reattach path must re-mint rather than replay a stored token.
+- **Revocation** on session termination, and on backend switch (`SandboxBackendSessionState.backendName` mismatch).
+- **Rejection rules** — the in-image agent must reject any request whose token does not bind to its own session, so a leaked endpoint URL alone is not sufficient to reach it.
 `defaultSandbox()` probe chain (`src/public/sandbox/backends/default.ts`) becomes
 MicroVM (when running on Lambda) → Docker → microsandbox → just-bash; the local backends
 stay and remain the dev path. Delete `src/execution/sandbox/bindings/vercel*.ts` (8 files)
@@ -225,11 +354,17 @@ from template-key derivation (`src/runtime/sandbox/keys.ts`) in favor of an acco
 
 ### Schedules — EventBridge Scheduler
 Discovery/compile/dispatch stay as-is. Only the trigger changes: `eve build` emits each
-`defineSchedule` cron into the deploy manifest; CDK creates EventBridge Scheduler rules
-that invoke the HTTP Lambda's cron route (keep the existing unguessable-path idea from
-`cron-handler-route.ts`, or invoke the durable function directly). Nitro's in-process
-`scheduledTasks` registration is removed. `eve dev`'s manual dispatch route
-(`POST /eve/v1/dev/schedules/:scheduleId`) is unchanged.
+`defineSchedule` cron into the deploy manifest and CDK creates EventBridge Scheduler rules.
+Nitro's in-process `scheduledTasks` registration is removed. `eve dev`'s manual dispatch
+route (`POST /eve/v1/dev/schedules/:scheduleId`) is unchanged.
+
+**Be concrete about the invoke mechanics.** EventBridge Scheduler invokes Lambda with a
+raw event, not an HTTP request, so reaching a Nitro route means synthesizing a
+Function-URL-shaped event payload. Going the other way — pointing EventBridge at the
+Function URL — does not work: the URL is `AWS_IAM`-authed and EventBridge API destinations
+do not sign SigV4. **Decision: direct Lambda invoke with a synthesized event.** One
+consequence to carry forward: the unguessable-cron-path secret from `cron-handler-route.ts`
+is redundant under IAM auth and should be dropped rather than ported.
 
 ### Auth
 Delete `vercelOidc()` from `src/public/channels/auth.ts` and `src/public/agents/auth.ts`,
@@ -261,6 +396,14 @@ Rename: `@vercel/eve-catalog` workspace package, `ghcr.io/vercel/eve` image, the
 `@vercel/detect-agent` (or vendor the last one's heuristic — it is trivial and useful),
 and the `@vercel/connect` scaffolding in `src/setup/scaffold/**`.
 
+### Touchpoints easy to miss
+**229 non-test source files** mention Vercel. The inventory above covers the load-bearing
+majority; these three clusters are easy to overlook and each needs an explicit disposition:
+
+- **The TUI remote-attach flow** — `src/services/dev-client/{vercel-auth-error,request-headers,credential-gate}.ts` plus `src/cli/dev/tui/{remote-auth*,remote-connection*,vercel-status,vercel-trusted-sources*}.ts`. The whole "attach the local TUI to a deployed agent" experience authenticates against a Vercel project. It needs an AWS story (SigV4 from the local credential chain is the obvious one) or explicit removal — do not let it rot half-ported.
+- **Error classification** — `src/harness/semantic-errors/rules/{gateway,workflow}.ts`, `src/harness/workflow-stream-error.ts`, `src/harness/model-call-error.ts`. These are keyed to Gateway and Workflow-SDK error *shapes*. Without Bedrock and durable-SDK equivalents, errors silently misclassify and users get misleading hints — worse than no classification.
+- **Channel setup** — `src/setup/channel-setup-{slack,deployment}.ts` embed deployment URLs derived from the Vercel project link, which the webhook-registration flows depend on.
+
 ### e2e
 `.github/workflows/e2e-vercel.yml` and the shared-Vercel-project model in `e2e/README.md`
 are replaced by a CDK stack deployed per CI run into a test account, with the 23 fixtures
@@ -272,24 +415,41 @@ under `e2e/fixtures/` deployed behind one Function URL each and torn down after.
 
 ## Phases
 
-**Phase 0 — De-Vercel without changing behavior.** *Independently shippable.*
+**Phase 0 — De-Vercel without changing behavior.** *Mergeable, but local-dev-only.*
 Delete `eve deploy`/`eve link`, the `src/setup/` Vercel surface, the framework
 `vercel-*` output writers, `vercel-agent-summary`, and the `@vercel/*` deps.
 Switch the Nitro preset to `aws-lambda`. Pin the sandbox to Docker and the workflow
 world to `@workflow/world-local` so the tree stays green. Rebrand.
 This is mostly deletion and lands fast — it makes every later phase smaller.
 
+Be honest about what it costs: **after Phase 0 there is no production deployment path at
+all** until Phases 1 and 4 land — the deploy CLI is gone, Vercel output emission is gone,
+and the AWS runtime does not exist yet. That is acceptable for a hard fork, but it is not
+"independently shippable" in the usual sense. Also verify early that the tree actually
+builds with the preset switched to `aws-lambda` while the workflow bundle still emits
+Vercel-shaped output — that combination is untested and may not survive contact.
+
 **Phase 1 — Durable execution on Lambda. *The long pole.***
-Vendor `@aws/durable-execution-sdk-js`. **Spike first:** confirm `LocalDurableTestRunner`
-can start a TypeScript execution without awaiting it to completion (see above) — this
-gates the whole local-dev story and is a half-day answer. Then define the `DurableBackend`
-seam and land the **`local` backend first** — it keeps `eve dev` and the test tiers
-working throughout the rewrite, and it is the cheapest place to prove the design against a
-fixed `Runtime` interface. Build the event log and
-hook-token index behind that seam. Rewrite `workflow-entry.ts` / `turn-workflow.ts` /
-`workflow-steps.ts` against `DurableContext`, keeping `workflow-runtime.ts`'s `Runtime`
-interface fixed so channels and the harness are untouched. Delete
-`src/internal/workflow-bundle/` and `src/internal/workflow/`. Add the `aws` backend last.
+Vendor `@aws/durable-execution-sdk-js`.
+
+**Spike these four before writing anything — together they are days, not weeks, and each
+can invalidate a load-bearing design choice:**
+
+1. Can `LocalDurableTestRunner` start a TypeScript execution **without awaiting** it to completion? Gates the entire local-dev story.
+2. Does `nitro@3.0.260610-beta`'s `aws-lambda` preset support `streamifyResponse` / `RESPONSE_STREAM`? Gates incremental NDJSON delivery — without it the streaming UX is dead on arrival.
+3. Can a callback be **raced against an in-flight step**, and what happens to the losing branch on replay? Gates cancellation.
+4. What does a full session snapshot actually cost per step in checkpoint bytes? Gates whether S3 offload is required immediately (it probably is).
+
+Then define the `DurableBackend` seam and land the **`local` backend first** — it keeps
+`eve dev` and the test tiers working throughout the rewrite, and it is the cheapest place
+to prove the design against a fixed `Runtime` interface. Move session snapshots off stream
+namespaces to DynamoDB+S3 (gap 2, Fix A) — this is Phase 1 work, not a later optimization.
+Build the event log with an explicit replay-idempotency scheme, and the hook-token index
+with a park/retry policy for the deliver-before-mapping race. Rewrite `workflow-entry.ts` /
+`turn-workflow.ts` / `workflow-steps.ts` against `DurableContext`, keeping
+`workflow-runtime.ts`'s `Runtime` interface fixed so channels and the harness are
+untouched. Delete `src/internal/workflow-bundle/` and `src/internal/workflow/`. Add the
+`aws` backend last.
 Everything downstream depends on this; nothing else should start until the `Runtime`
 interface is proven against the local backend.
 
@@ -320,18 +480,10 @@ Rewrite `docs/guides/deployment/**`, `docs/sandbox.mdx`, `docs/schedules.mdx`,
 
 ## Open risks
 
-1. **Durable-function payload/checkpoint costs.** eve checkpoints a full session snapshot per step (`durable-session-store.ts`). Metering is per-operation *and* per-payload-byte; large snapshots in a long session could get expensive. Measure early in Phase 1 and consider offloading snapshots to S3 with only a pointer checkpointed.
+1. **Durable-function payload/checkpoint costs.** eve checkpoints a full session snapshot per step (`durable-session-store.ts`). Metering is per-operation *and* per-payload-byte; large snapshots in a long session get expensive fast. Since snapshots must move off stream namespaces anyway (gap 2, Fix A), **S3 offload with only a pointer checkpointed is now a Phase 1 requirement**, not a contingency. Measure in spike 4.
 2. **Replay determinism.** eve's step bodies do model calls, tool calls, and clock reads. Everything non-deterministic must sit inside `context.step()`. `src/harness/tool-loop.ts` (~2,400 lines) is the file to audit hardest.
 3. **Concurrent callback completion.** eve's turn-inbox hook can receive multiple deliveries; AWS callbacks appear to be single-completion. The inbox may need one callback per delivery rather than a reusable hook.
 4. **MicroVM API maturity.** It is new; confirm the JS SDK surface, per-account MicroVM quotas, and image build times before committing Phase 3's schedule.
 5. **The local runner is a test harness doing a dev-runtime job.** It is the right call — it is the only credential-free, container-free option — but it is not what AWS designed it for. Undocumented limits (max invocations per runner, concurrent executions, payload ceilings) may surface only under a real `eve dev` session. The Phase 1 spike and the `DurableBackend` seam exist to keep that discovery cheap.
-
----
-
-## References
-
-- [Lambda durable functions](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html)
-- [Durable execution SDK](https://docs.aws.amazon.com/lambda/latest/dg/durable-execution-sdk.html)
-- [Callback operation API](https://docs.aws.amazon.com/durable-execution/sdk-reference/operations/callback/)
-- [Testing runners](https://docs.aws.amazon.com/durable-execution/testing/runner/) and [testing API reference](https://docs.aws.amazon.com/durable-execution/testing/api-reference/)
-- [Lambda MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html)
+6. **Streaming concurrency cost.** Under `RESPONSE_STREAM`, each connected tail client pins one HTTP-Lambda concurrent execution for up to 15 minutes while long-polling DynamoDB. At even modest concurrent-session counts this dominates the compute bill and can hit account concurrency limits — model it before committing to long-poll over a push transport.
+7. **Unkillable executions.** With no stop API, an execution wedged before it reaches the cancel race cannot be terminated (gap 3). Worth confirming whether Lambda exposes *any* administrative stop before accepting this.

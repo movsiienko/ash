@@ -173,12 +173,43 @@ went through a stream. **That was an overcorrection.** New sessions already carr
 snapshot through step results; under this repo's pre-1.0 no-legacy-fallback rule the stream
 branch is simply deleted, and `durable-session-store.ts` largely survives.
 
-**Fix A — move snapshots to DynamoDB + S3 anyway, but for the right reason.** The
-justification is **checkpoint payload size and cost**, not streams disappearing: eve
-checkpoints a full session snapshot per step, metering bills per-operation *and*
-per-payload-byte, and DynamoDB items cap at 400 KB. Whether this is Phase 1 or later
-depends on spike 2's measurement — argue it from payload economics, not from a
-non-existent read-path break.
+**Fix A — externalize snapshots to S3, pointer-checkpointed. This is structurally required,
+not a cost optimization.**
+
+Three independent arguments, in increasing order of force:
+
+1. *Cost* — eve checkpoints a full snapshot per step; metering bills per-operation **and** per-payload-byte.
+2. *The 100 MB ceiling* — `DurableExecutionStorageWrittenBytes` is capped per execution, and inline snapshots consume it fastest.
+3. *Decisive: separate executions cannot share checkpoint state.* Each durable execution has its own checkpoint log that other executions cannot read. Since every turn is a **separate** execution dispatched via `context.invoke` (see the versioning section), the turn cannot reach the driver's checkpoints — session state must be passed in the invoke payload, which caps at **1 MB**. Inline state therefore breaks the driver→turn handoff permanently once history exceeds 1 MB, days into a months-long session. Externalization is the only way the per-turn-invocation design works at all.
+
+**Shape:** one immutable snapshot object per turn in S3 under a **deterministic key** derived
+from `(sessionId, turn, step)` — so a durable retry overwrites rather than duplicates, and
+S3 PUT idempotency gives exactly-once for free — plus a small DynamoDB **session head**
+record `{latestSnapshotKey, seq, fenceToken}` as the mutable rendezvous point for rollover
+and external readers. Small intra-turn step results stay inline; only oversized ones spill.
+Invoke payloads then carry `{sessionId, snapshotKey, seq}`, comfortably inside 1 MB.
+
+**Rejected: an S3 JSONL delta log.** It is the intuitive shape and it does not survive
+contact. S3 objects are immutable — there is no append — so "JSONL" means one object per
+delta plus a manifest, or multipart upload (disqualified: ≥5 MB parts, and the object is
+unreadable until the upload completes). Its failure mode is **O(n) GET fan-out on
+rehydration**: a session on day 60 with thousands of deltas needs thousands of reads to
+reconstruct state, turning a ~50 ms resume into tens of seconds. The standard fix —
+periodic compacted snapshots — *is* the design above, with a delta log bolted on. Note also
+that JSONL-versus-snapshot is irrelevant to both ceilings: any externalization gets the
+same relief.
+
+**Replay invariant to hold:** rehydrate only the **frontier** snapshot — one GET at resume,
+O(1). The SDK replays from the beginning on every wake, so dereferencing a pointer at every
+replayed step would make resume O(steps) in S3 round-trips. Snapshot-pointer makes this
+natural (stale pointers are simply never fetched); a delta log makes it structurally hard,
+since "current state" is not an object and the tail must be folded every time.
+
+**Latency is a non-issue here.** S3 is ~30–80 ms versus DynamoDB's ~5–10 ms, but this is
+one round-trip *per turn*, in a loop dominated by multi-second model calls, with token
+streaming on a separate path off the persistence boundary. Snapshots stay small in practice
+because `shouldCompact` (`src/harness/compaction.ts:59`) already bounds history against the
+model's context window — eve must compact for the model regardless.
 
 **Fix B — the client tail becomes an event log.** This one *is* unavoidable. Append-only
 DynamoDB, long-polled by the HTTP Lambda. Keep it behind a narrow interface so
@@ -375,8 +406,13 @@ Design the handoff explicitly in Phase 1:
 
 - **Track both budgets** as first-class session state, not just operations — a session with large payloads will hit 100 MB well before 3,000 operations.
 - **Hand off to a successor execution** before either ceiling, at a turn boundary where state is quiescent.
-- **Transfer ownership atomically**: token index entries, inbox high-water `seq`, event-log cursor, and the snapshot pointer must all move to the successor in one step, or a delivery in flight during rollover is lost or double-processed.
+- **Transfer ownership atomically**: token index entries, inbox high-water `seq`, event-log cursor, and the snapshot pointer must all move to the successor in one step, or a delivery in flight during rollover is lost or double-processed. The DynamoDB session head record (Fix A) is the natural place to do this — a single conditional update on `fenceToken` both publishes the successor and fences the predecessor.
 - **Keep `sessionId` stable across rollovers.** It is the client-facing identity and the event-log partition key; only the execution behind it changes.
+
+Externalized snapshots make this handoff nearly free: the successor starts with
+`{sessionId, snapshotKey, seq}` and reads the frontier snapshot. With inline state, rollover
+would mean marshaling the entire session through an invoke payload — the same 1 MB cliff
+that already rules inline state out.
 
 Keep the **snapshot format**, `durable-session-migrations/`, and most of
 `durable-session-store.ts` — see gap 2: the namespaced-stream read is a legacy fallback that
@@ -712,7 +748,7 @@ while callbacks complete concurrently. The local-dev story stands.
 
 1. Can a callback be **raced against an in-flight step**, and what happens to the losing branch on replay? Gates *turn* cancel only — session terminate has `StopDurableExecution` behind it.
 2. **What does the parent observe when a per-turn child execution is stopped mid-flight?** The per-turn `context.invoke` design makes `StopDurableExecution` turn-granular, but the driver's checkpointed `invoke` operation sees *something* when its child is stopped — an error result, presumably. If the SDK retries a failed child invocation it would **resurrect a cancelled turn**, which is worse than not cancelling. Same feature as unknown 1; spike them together.
-3. What does a full session snapshot cost per step in checkpoint bytes? Gates how aggressive the S3 offload threshold must be, and now carries Fix A's whole justification.
+3. What does a full session snapshot cost per step in checkpoint bytes? No longer gates *whether* to externalize — Fix A settles that structurally — but sizes the inline-vs-spill threshold for intra-turn step results, and calibrates how close a busy session gets to the 3,000-operation ceiling before rollover.
 4. **How is the stream attempt id allocated?** `StepContext` does not expose the retry attempt, so the generation-aware cursor (gap 2) needs an eve-owned scheme. On the critical path for the client protocol change.
 
 **Phase 1 needs a real AWS gate, not just the local backend.** The CDK stack is scheduled in
@@ -788,7 +824,7 @@ e2e workflow.
 
 ## Open risks
 
-1. **Durable-function payload/checkpoint costs.** eve checkpoints a full session snapshot per step (`durable-session-store.ts`). Metering is per-operation *and* per-payload-byte, and DynamoDB items cap at 400 KB, so large snapshots in a long session get expensive fast. This is now the **sole** justification for the S3 offload (gap 2, Fix A) — spike 3 measures it and decides whether it lands in Phase 1 or later. Do not treat it as settled in either direction before that measurement.
+1. **Durable-function payload/checkpoint costs.** eve checkpoints a full session snapshot per step (`durable-session-store.ts`), and metering bills per-operation *and* per-payload-byte. Externalizing snapshots to S3 (gap 2, Fix A) removes the ceiling risk and most of the cost; what remains is calibration — spike 3 sizes the inline-vs-spill threshold. The residual risk is **operation count**, not bytes: with rollover in place a session survives indefinitely, but rollover frequency is now a cost driver worth measuring under a realistic turn cadence.
 2. **Replay determinism.** eve's step bodies do model calls, tool calls, and clock reads. Everything non-deterministic must sit inside `context.step()`. `src/harness/tool-loop.ts` (~2,400 lines) is the file to audit hardest.
 3. **Concurrent callback completion.** eve's turn-inbox hook can receive multiple deliveries; AWS callbacks appear to be single-completion. The inbox may need one callback per delivery rather than a reusable hook.
 4. **MicroVM API maturity.** It is new; confirm the JS SDK surface, per-account MicroVM quotas, and image build times before committing Phase 3's schedule.

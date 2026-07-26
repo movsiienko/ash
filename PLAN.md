@@ -628,46 +628,73 @@ not an API key. Delete `src/internal/gateway.ts`, `src/internal/runtime-model.ts
 (`src/setup/{ai-gateway-api-key,validate-gateway-key,gateway-models}.ts`,
 `src/setup/boxes/{detect-ai-gateway,apply-ai-gateway-credential}.ts`); `WiringMode`
 in `src/setup/state.ts:101` collapses to a single mode.
-`DEFAULT_AGENT_MODEL_ID` → a **concrete** Bedrock id, not a wildcard. Get the id shape
-right, because an earlier draft of this plan had it backwards. Anthropic dropped the dated
+**Decision: there is no default model id. Delete `DEFAULT_AGENT_MODEL_ID` as a fallback.**
+Earlier drafts of this plan argued over *which* Bedrock id to make the default. Wrong
+question — on Bedrock a framework-chosen model id is a guess about someone else's account,
+and it should be an authoring error to omit one.
+
+The deletion is small, because the implicit path is already narrow. `PublicAgentDefinition.model`
+is **required** (`src/shared/agent-definition.ts:276`), so any authored `agent.ts` declares a
+model today. The default has exactly one implicit consumer: `compileAgentConfig` substitutes
+`{ model: DEFAULT_AGENT_MODEL_ID }` when an agent directory has **no config module at all**
+(`src/compiler/normalize-agent-config.ts:40`). That branch becomes a compile error naming the
+agent and the field to add. Everything else the constant feeds is a *scaffold* value, not a
+runtime fallback, and stays:
+
+- `eve init` writes a literal id into the generated `agent.ts` (`src/cli/commands/init.ts:168,216`) — the result is explicit in authored source, which is the point.
+- The setup picker pre-selects one entry (`src/setup/boxes/select-model.ts:58,216`).
+
+Rename the constant to `INIT_SCAFFOLD_MODEL_ID` so the distinction is structural rather than
+conventional, and let `guard:invariants` keep it out of `src/compiler/` and `src/runtime/`.
+Removing an implicit default is a behavior break for a config-less agent directory →
+**`minor` changeset**, with the error message doing the migration work.
+
+Why this is more clearly right on Bedrock than it was on the Gateway: model access is
+**per-account opt-in and region-gated**, so a default names a model the account may not have
+enabled and fails at first inference rather than at build. The geo-profile choice is a
+**data-residency decision** that must never be made silently on an operator's behalf. And
+IAM grants must be scoped to the id actually in use — with no default, CDK derives
+`bedrock:InvokeModel` / `InvokeModelWithResponseStream` grants from the *authored* ids in the
+manifest instead of granting a guessed one.
+
+**What authors must then be told**, in docs and in the compile error. An earlier draft of
+this plan had the id shape backwards, so state it correctly. Anthropic dropped the dated
 `…-v1:0` suffix starting with Sonnet 4.6, so for Sonnet 5 the
 [model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html)
 publishes:
 
 - `anthropic.claude-sonnet-5` — the **base foundation-model id**, valid on both `InvokeModel`
   and `Converse`. It is not a Messages-API-only id, and there is no dated Converse variant to
-  prefer over it.
+  prefer over it. Stays in the calling region; forfeits cross-region capacity headroom.
 - `us.` / `eu.` / `au.` / `global.` `anthropic.claude-sonnet-5` — **geo inference profiles**
-  over that same model. Different routing and residency, same API surface.
+  over that same model. Same API surface, different routing and residency: a geo profile may
+  route anywhere in its geography, and `global.` has no residency constraint at all.
+- `arn:aws:bedrock:<region>:<account>:inference-profile/...` — an application inference
+  profile, for single-region routing under a residency constraint.
 
-Pin one exact string, and verify it against the model card **and** the vendored
-`@ai-sdk/amazon-bedrock` version at the moment it lands — provider releases lag new model
-ids, and a provider that predates Sonnet 5 will reject it regardless of what Bedrock accepts.
-
-Which of the two to pin is a residency decision, not a routing detail, and belongs in the
-same commit as the id. A geo profile such as `us.` may route to any region in its geography;
-`global.` has no residency constraint at all; the bare model id stays in the calling region
-but forfeits cross-region capacity headroom. The choice also changes the IAM shape: with a
-profile, the execution role needs `bedrock:InvokeModel` /
-`InvokeModelWithResponseStream` on the inference-profile ARN **and** on the underlying
-foundation-model ARNs in every region the profile can reach; with the bare model id, only
-the single-region foundation-model ARN. **Recommendation: default to `us.anthropic.claude-sonnet-5`**
-for capacity, and document the override — deployments under residency constraints point
-`agent.ts` at a single-region profile
-(`arn:aws:bedrock:<region>:<account>:inference-profile/...`) or the bare model id.
+The choice also sets the IAM shape, which is why it belongs to the author rather than the
+framework: a geo profile needs grants on the profile ARN **and** on the underlying
+foundation-model ARNs in every region it can reach, while a bare model id needs only the
+single-region foundation-model ARN. Whatever `eve init` scaffolds must be verified against
+the model card **and** the vendored `@ai-sdk/amazon-bedrock` version at the moment it lands —
+provider releases lag new model ids, and a provider predating Sonnet 5 rejects it regardless
+of what Bedrock accepts.
 **`src/compiler/model-catalog.ts` needs a decision**: it fetches the Gateway catalog at
 build time to bake `contextWindowTokens`/`maxOutputTokens` into the manifest. Bedrock's
 `ListFoundationModels` does not reliably expose context windows — bake a static catalog
 and let `agent.ts` override.
 
-**Bedrock-as-default partly contradicts the credential-free local story.** The `local`
-durable backend needs no AWS credentials, but a Bedrock default means `eve dev` and local
-e2e need them for *every model call* — so "no AWS account required" is only true of the
-durable layer, not of running an agent. Resolve it explicitly: `@ai-sdk/anthropic` and
-`@ai-sdk/openai` are **already vendored**, so keep direct API-key providers as the
-first-class local path, and state what bare-string resolution does off-Lambda (recommended:
-resolve to Bedrock only when AWS credentials are present, otherwise require an explicit
-provider-qualified id and fail with a clear message rather than an opaque credential error).
+**Bare-string-resolves-to-Bedrock still partly contradicts the credential-free local story.**
+Dropping the default model id removes half of this tension — the framework no longer steers
+anyone onto Bedrock implicitly, and an author who wants a local API-key provider simply names
+one. What remains is bare-string resolution: the `local` durable backend needs no AWS
+credentials, but an id that resolves to Bedrock means `eve dev` and local e2e need them for
+*every model call*, so "no AWS account required" would be true of the durable layer and not
+of running an agent. Resolve it explicitly: `@ai-sdk/anthropic` and `@ai-sdk/openai` are
+**already vendored**, so keep direct API-key providers as the first-class local path, and
+state what bare-string resolution does off-Lambda (recommended: resolve to Bedrock only when
+AWS credentials are present, otherwise require an explicit provider-qualified id and fail
+with a clear message rather than an opaque credential error).
 
 ### Sandbox — Lambda MicroVM
 Maps cleanly onto the existing `SandboxBackend` interface
@@ -996,7 +1023,7 @@ e2e workflow.
   - **A type-fidelity round-trip** over the snapshot (`Date`, `Map`, `Set`, `Buffer`, URL `FilePart.data`) to catch serde degradation.
 
   Then `eve dev` end-to-end against `apps/fixtures/weather-agent`, driving a real multi-turn conversation and confirming events stream and a HITL approval round-trips.
-- **Phase 2:** run an agent against a real Bedrock model id; confirm the compiled manifest carries correct context-window limits and that compaction triggers at the right threshold.
+- **Phase 2:** run an agent against a real Bedrock model id; confirm the compiled manifest carries correct context-window limits and that compaction triggers at the right threshold. Also assert the **absence** of a default: an agent directory with no config module must fail the build with a message naming the agent and the `model` field, not silently compile against a framework-chosen id.
 - **Phase 3:** `e2e/fixtures/agent-tools-sandbox` locally against Docker, then a deployed MicroVM: create a session, write a file, let it idle into suspend, resume **within the 8-hour cap**, confirm the file survived. Then the case that actually matters — force expiry past the cap and confirm **cold rehydrate** recreates the sandbox and re-seeds files rather than erroring.
 - **Phase 4/5:** deploy the CDK stack to a test account and run `eve eval` against the Function URL — the same shape as today's `e2e-vercel.yml`, different target.
 

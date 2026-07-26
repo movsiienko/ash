@@ -125,9 +125,11 @@ missing mapping does not fix this — the semantics are simply different.
 
 **Fix: a durable inbox, with callbacks demoted to wake-up signals.**
 
-- **Key: `(sessionId, seq)` — not `(sessionId, deliveryId)`.** `deliveryId` is an idempotency key with no ordering, but `bufferedDeliveries` (`session-delivery-hook.ts:43`) preserves **arrival order** today, and losing that is a user-visible semantic change. Allocate `seq` atomically with the same discipline gap 2 applies to the event log — `UpdateItem` `ADD` on a per-session counter, never read-then-write — and carry `deliveryId` as a separate attribute with a conditional write for idempotency.
+- **Key: `(sessionId, seq)` — not `(sessionId, deliveryId)`.** `deliveryId` is an idempotency key with no ordering, but `bufferedDeliveries` (`session-delivery-hook.ts:43`) preserves **arrival order** today, and losing that is a user-visible semantic change. Allocate `seq` atomically with the same discipline gap 2 applies to the event log — `UpdateItem` `ADD` on a per-session counter, never read-then-write.
+- **Dedupe needs a transaction, not a condition expression.** With `(sessionId, seq)` as the primary key, a `ConditionExpression` on a non-key `deliveryId` only evaluates the single item being written — DynamoDB cannot enforce uniqueness across a partition. A retried delivery gets a *new* `seq` and the condition passes, so the message is processed twice. Use `TransactWriteItems` containing (a) a `Put` on a separately keyed dedupe record `(sessionId, deliveryId)` with `attribute_not_exists`, and (b) the sequenced inbox item. The transaction fails atomically on replay.
 - After enqueuing, `deliver()` completes the current wake-up callback. A completion that loses a race is harmless: the message is already durable in the inbox.
-- **Drain protocol** ("atomically drains" is not a DynamoDB primitive, so specify it): `Query` the session partition above the last-processed `seq` in order; claim each item with a conditional update (or delete) so a replayed drain cannot double-process; record the high-water `seq` in the checkpoint. Items landing **mid-drain** are not swept into the current pass — they wake the next callback, which is what makes the protocol terminate.
+- **Drain protocol** ("atomically drains" is not a DynamoDB primitive, so specify it): `Query` the session partition above the last-processed `seq` in order; claim each item with a conditional update (or delete) so a replayed drain cannot double-process; record the high-water `seq` in the checkpoint.
+- **Arm the next callback *before* the final empty check — otherwise deliveries are lost forever.** An earlier draft said mid-drain arrivals "wake the next callback," which is wrong: between the callback that woke the execution being consumed and a fresh one being armed, **no callback exists**. A delivery landing in that window writes to the inbox, finds nothing to signal, and parks indefinitely — the execution has already decided the inbox is empty and suspended. Correct sequence: arm a **generation-stamped** callback first, then re-`Query` above the high-water mark, then conditionally publish that generation. The re-query after arming is what closes the window.
 - The token index (`token → {callbackId, executionId, ttl}`) still exists, but only to find the *current* wake-up callback — losing the race to a stale one no longer loses a message.
 
 Use **`waitForCallback(name, submitter, config)`** rather than raw `createCallback()`: the
@@ -195,7 +197,22 @@ The design must nail down four things, not just pick a scheme:
 1. **Sequence allocation is atomic.** Either a DynamoDB `UpdateItem` `ADD` on a per-session counter item, or a conditional `PutItem` on `attribute_not_exists(seq)` with retry on collision. Never read-then-write.
 2. **Attempt-scoped keys.** `(sessionId, attempt, seq)`, with the tail following the highest attempt. Preferred over truncate-on-retry: it is a single conditional write, and it preserves superseded attempts for debugging replay divergence — exactly the failure this design is most likely to hit.
 3. **An explicit idempotency key** on every append — `(sessionId, attempt, seq)` is sufficient and lets a retried write be a no-op rather than a duplicate.
-4. **Defined client behavior — and this *does* change the stream protocol.** An earlier draft claimed the wire format was unaffected. It is not. `followStreamIterable` (`src/client/open-stream.ts:100`) tracks a single integer `startIndex` advanced per received event; events carry no attempt or generation identifier, and the reducer never sees response metadata. As written, the client cannot detect a rollover, discard superseded events, or reset its cursor. Required: a **generation-aware cursor** — either a composite `(attempt, seq)` cursor on the wire, or an explicit attempt-boundary event the reducer can act on. Superseded events are dropped client-side; duplicates are idempotent on `(attempt, seq)`.
+4. **Defined client behavior — and this *does* change the stream protocol.** An earlier draft claimed the wire format was unaffected. It is not. `followStreamIterable` (`src/client/open-stream.ts:100`) tracks a single integer `startIndex` advanced per received event; events carry no attempt or generation identifier, and the reducer never sees response metadata. As written, the client cannot detect a rollover, discard superseded events, or reset its cursor. Required: a **generation-aware cursor** — either a composite `(attempt, seq)` cursor on the wire, or an explicit attempt-boundary event the reducer can act on. Duplicates are idempotent on `(attempt, seq)`.
+
+   **"Discard superseded events client-side" is not sufficient on its own**, and this is the
+   deepest problem in the design. `runSession` yields each event the moment it arrives
+   (`src/client/session.ts:318` — `events.push(event); yield event;`), so by the time
+   attempt B exists, attempt A's tokens have already been rendered in a UI, forwarded to
+   Slack, or acted on by a consumer. Dropping them from a *future* read changes nothing.
+   Steps are at-least-once, and a retried model call streams *different* text, so this is
+   visible output that has to be un-said. Pick one and state it:
+
+   - **Retraction semantics on the wire** — an explicit "attempt superseded, discard from `seq` N" event that every consumer must honor. Cheapest to implement, but it pushes the problem onto every client and every channel adapter.
+   - **Buffer until checkpoint** — hold model output until the step checkpoints, then release. Correct and simple to reason about, but it forfeits token-level streaming, which is the point of the NDJSON tail.
+   - **An independently idempotent outbox** — move model generation behind a boundary that produces the same event sequence on retry. Best semantics, most work.
+
+   This is a **user-visible protocol decision**, not an implementation detail, and it should
+   be settled before the client work starts.
 
 **Open sub-problem: where does the attempt id come from?** TypeScript's `StepContext` does
 not expose the current retry attempt, so eve cannot simply read it. Options are an
@@ -284,12 +301,28 @@ results can be large), and snapshots. Specify a single size-check-and-offload he
 inline below the threshold, S3 pointer above it — and route every write through it.
 Handling only `start()` leaves two live failure paths.
 
-**Starts need an idempotency key too.** Async invocation plus client retries will otherwise
-open duplicate durable sessions for one logical session. Lambda provides
-[execution-name idempotency](https://docs.aws.amazon.com/lambda/latest/dg/durable-execution-idempotency.html)
-for exactly this: preallocate the eve session id and pass it as the durable execution name,
-so a retried start is a no-op rather than a second session. Deliveries get the equivalent
-via the conditional inbox write on `deliveryId` (gap 1).
+**Starts need an idempotency key too — and eve does not currently have one.** Lambda
+provides [execution-name idempotency](https://docs.aws.amazon.com/lambda/latest/dg/durable-execution-idempotency.html):
+pass the eve session id as the durable execution name and a retried start is a no-op rather
+than a second session. But that only works if **every retry presents the same id**, and
+today nothing carries one: `RunInput` has no caller-supplied session or idempotency key,
+`DeliverInput` has no `deliveryId` (`src/channel/types.ts:272`), and the only request
+identifier in the stack is derived from the `x-vercel-id` header
+(`channel-dispatch.ts:249`) — which disappears with Vercel.
+
+So Phase 1 needs an **ingress idempotency contract** as new public surface, mapping each
+entry point to a stable key:
+
+| Ingress | Natural key |
+|---|---|
+| Browser / SDK client | client-generated UUID, sent on start and retried unchanged |
+| Channel webhooks | provider event id — Slack `event_id`, GitHub `X-GitHub-Delivery`, Stripe-style event ids; every supported provider already sends one, and they are precisely designed for redelivery |
+| Schedules | EventBridge invocation id |
+| Subagent / remote-agent calls | parent-allocated id, derived from the calling step |
+
+Without this, at-least-once webhook redelivery — which every one of these providers does by
+design — silently starts duplicate sessions. Deliveries use the same key as `deliveryId` in
+the inbox transaction (gap 1).
 
 ---
 
@@ -328,10 +361,26 @@ deployments while the driver stays pinned, matching today's semantics. `StopDura
 also becomes per-turn granular, which is a bonus for turn cancel. If this is not done, the
 regression must be stated explicitly rather than left implicit.
 
-Keep the **snapshot format** and `durable-session-migrations/` — both are platform-neutral
-and the versioning is worth preserving. But `durable-session-store.ts` itself must be
-**rewritten**, not kept: its read path (`:138`) pulls the snapshot off a namespaced
-workflow stream, which has no AWS equivalent (gap 2, Fix A). Delete
+**But the driver cannot live forever — it needs a rollover strategy.** A single durable
+execution is hard-capped at **3,000 operations** and **100 MB of cumulative persisted data**
+(`DurableExecutionOperations` and `DurableExecutionStorageWrittenBytes`, both documented with
+explicit maxima in the
+[monitoring docs](https://docs.aws.amazon.com/lambda/latest/dg/durable-monitoring.html)).
+Every turn adds at least one chained `invoke` to the root execution, plus whatever the
+driver checkpoints alongside it — so a long-running session walks steadily toward both
+ceilings. eve's whole premise is sessions that live for days or months, so this is not a
+tail case; it is the expected path.
+
+Design the handoff explicitly in Phase 1:
+
+- **Track both budgets** as first-class session state, not just operations — a session with large payloads will hit 100 MB well before 3,000 operations.
+- **Hand off to a successor execution** before either ceiling, at a turn boundary where state is quiescent.
+- **Transfer ownership atomically**: token index entries, inbox high-water `seq`, event-log cursor, and the snapshot pointer must all move to the successor in one step, or a delivery in flight during rollover is lost or double-processed.
+- **Keep `sessionId` stable across rollovers.** It is the client-facing identity and the event-log partition key; only the execution behind it changes.
+
+Keep the **snapshot format**, `durable-session-migrations/`, and most of
+`durable-session-store.ts` — see gap 2: the namespaced-stream read is a legacy fallback that
+simply gets deleted, not a read path that must be replaced. Delete
 `workflow-callback-url.ts` (Vercel protection-bypass) and
 `src/internal/workflow/{validate-world,world-compatibility,local-world-data-directory,development-world-*}.ts`
 — the World concept disappears entirely, along with `experimental.workflow.world`
@@ -366,9 +415,29 @@ reload of authored sources, and a dev-world RPC server
 run state alive across Nitro worker reloads.
 
 **No SAM.** The local runner from `@aws/durable-execution-sdk-js-testing` is the local
-runtime. Rather than binding `workflow-runtime.ts` directly to either SDK, put a thin
-eve-owned **`DurableBackend`** interface behind it — `startExecution`, `completeCallback`,
-`getExecution`, `appendEvents`, `tailEvents` — with two implementations:
+runtime. Rather than binding `workflow-runtime.ts` directly to either SDK, put thin
+eve-owned interfaces behind it.
+
+**One five-method `DurableBackend` is too narrow.** `startExecution` / `completeCallback` /
+`getExecution` / `appendEvents` / `tailEvents` omits stop/terminate, token ownership, inbox
+operations, callback generations, and snapshot storage — most of what the preceding gaps
+actually introduced. It also hides a conflict: resolving a session through *runner
+operations* locally cannot satisfy the requirement that token→session ownership survive
+long idles when **no callback is armed** (gap 1). Split it into five narrow interfaces with
+independent local/AWS implementations:
+
+| Interface | Responsibility | Local | AWS |
+|---|---|---|---|
+| `ExecutionControl` | start, stop, describe, rollover | runner | `Invoke` / `StopDurableExecution` / `GetDurableExecution` |
+| `TokenOwnership` | token → session (session lifetime), token → armed callback (short) | disk/memory | DynamoDB, two lifetimes |
+| `DeliveryInbox` | enqueue (transactional dedupe), ordered drain, high-water | in-memory queue | DynamoDB + `TransactWriteItems` |
+| `EventLog` | append with attempt/seq, tail from cursor | in-memory ring | DynamoDB + long-poll |
+| `SnapshotStore` | put/get with size-based S3 offload | disk | DynamoDB + S3 |
+
+The seams are then independently testable, and the local backend stops being asked to
+emulate semantics the runner does not have.
+
+Two implementations of each:
 
 - **`local`** — `LocalDurableTestRunner`. No AWS credentials, no containers, no deployment. Hot reload and the TUI are unchanged. Because it performs **real replay** against a simulated checkpoint server, determinism bugs surface on the laptop rather than in production.
 - **`aws`** — `withDurableExecution` plus `SendDurableExecutionCallbackSuccess` / `GetDurableExecution` / `GetDurableExecutionHistory`.
@@ -487,11 +556,26 @@ writes reconnect metadata into durable session state that outlives the process, 
 `create()` reattaches suspended sessions from it. A sandbox executes model-generated code,
 so a token that leaks or over-scopes is a direct cross-tenant code-execution path. Specify:
 
-- **Where JWE tokens are minted and stored.** Mint in the app runtime, never inside the sandbox. Persist a *reference* in session state, not the token itself — the same rule `src/runtime/connections/scoped-authorization.ts` already applies to connection tokens.
-- **What each token binds to** — account, function, session id, and the single permitted port. A token valid for any session in the account is not acceptable.
-- **Expiry and rotation.** Sessions idle across suspend/resume up to the 8-hour cap, so tokens will outlive their validity; the reattach path must re-mint rather than replay a stored token, and the cold-rehydrate path mints fresh.
-- **Revocation** on session termination, and on backend switch (`SandboxBackendSessionState.backendName` mismatch).
-- **Rejection rules** — the in-image agent must reject any request whose token does not bind to its own session, so a leaked endpoint URL alone is not sufficient to reach it.
+**The AWS token cannot carry session identity — so this needs two layers.** An earlier draft
+said the in-image agent must "reject any request whose token does not bind to its own
+session." That is unimplementable. Per the
+[networking docs](https://docs.aws.amazon.com/lambda/latest/dg/microvms-networking.html), the
+`X-aws-proxy-auth` JWE is scoped to **a MicroVM id, a set of allowed ports, and an
+expiry** — not an account, function, or session. And decisively: *"Lambda removes
+`X-aws-proxy-*` headers before forwarding the request to your application."* The in-image
+server never sees the token and cannot inspect it.
+
+| Layer | Purpose |
+|---|---|
+| AWS JWE (`X-aws-proxy-auth`) | endpoint **ingress** only — proves the caller may reach this MicroVM on this port. Minted with `create-microvm-auth-token`, short-lived (verify the exact ceiling; the docs' example uses 30 minutes). |
+| eve application capability | **session binding** — a separate signed token in an ordinary header, minted by the app runtime and verified *inside* the VM against the session it was provisioned for. |
+
+Both are required: the JWE alone means anyone holding it reaches the VM with no session
+check, and an app capability alone cannot get past the endpoint. Remaining rules:
+
+- **Mint both in the app runtime**, never inside the sandbox. Persist a *reference* in session state, not the tokens — the rule `src/runtime/connections/scoped-authorization.ts` already applies to connection tokens.
+- **Expiry and rotation.** Both tokens are far shorter-lived than a session, so the reattach path must **re-mint** rather than replay stored tokens; cold rehydrate mints fresh.
+- **Revocation** on session termination and on backend switch (`SandboxBackendSessionState.backendName` mismatch). The in-image capability check is what makes revocation meaningful, since AWS tokens cannot be revoked before expiry.
 `defaultSandbox()` probe chain (`src/public/sandbox/backends/default.ts`) becomes
 MicroVM (when running on Lambda) → Docker → microsandbox → just-bash; the local backends
 stay and remain the dev path. Delete `src/execution/sandbox/bindings/vercel*.ts` (8 files)
@@ -527,6 +611,15 @@ most of eve's inbound traffic.
 |---|---|---|
 | Public (Function URL `NONE`, or API Gateway) | eve's own `routeAuth` chain — per-channel HMAC verification, `oidc()`, `jwtEcdsa()`, `httpBasic()` | browser clients, channel webhooks, OAuth callbacks |
 | Internal | `AWS_IAM` | agent→agent calls, EventBridge, internal invokes |
+
+**Two surfaces means route isolation must be enforced, not assumed.** Both URLs front the
+same Nitro handler, and AWS performs **no authentication at all** on a `NONE` Function URL —
+so without an explicit boundary the public URL reaches every internal route, and the IAM
+surface becomes decorative. Enforce it one of two ways: separate handler entries with
+disjoint route tables, or a single handler with a **surface-tagged route allowlist** checked
+before dispatch in `configure-nitro-routes.ts`. Either way it needs a test asserting that
+internal routes 404 on the public surface — this is the kind of boundary that silently
+regresses when a route is added.
 
 The existing `oidc()` / `jwtEcdsa()` / `jwtHmac()` / `httpBasic()` strategies are already
 generic and cover Cognito, so the public surface is well served today. Each channel's
@@ -622,6 +715,15 @@ while callbacks complete concurrently. The local-dev story stands.
 3. What does a full session snapshot cost per step in checkpoint bytes? Gates how aggressive the S3 offload threshold must be, and now carries Fix A's whole justification.
 4. **How is the stream attempt id allocated?** `StepContext` does not expose the retry attempt, so the generation-aware cursor (gap 2) needs an eve-owned scheme. On the critical path for the client protocol change.
 
+**Phase 1 needs a real AWS gate, not just the local backend.** The CDK stack is scheduled in
+Phase 4, but the local runner cannot validate IAM, service quotas, callback races, alias
+behavior, the 3,000-operation ceiling, or streaming — every one of which this plan now
+depends on. Stand up a **minimal spike stack early in Phase 1**: one durable Lambda, a
+callback dispatcher, the DynamoDB tables, and a streaming Function URL. It does not need to
+be the production stack; it needs to answer the unknowns above before the design hardens
+around guesses. Landing the `aws` backend "last in Phase 1" against no deployed environment
+is how integration failures get discovered in Phase 4.
+
 **Plus one cheap smoke test, deliberately not struck off.** The Nitro docs say the
 `aws-lambda` preset supports `awsLambda: { streaming: true }` over
 `awslambda.streamifyResponse`, and that is almost certainly right — but gap 6's entire
@@ -632,8 +734,9 @@ a public API semantic on an assumption.
 
 Then define the `DurableBackend` seam and land the **`local` backend first** — it keeps
 `eve dev` and the test tiers working throughout the rewrite, and it is the cheapest place
-to prove the design against a fixed `Runtime` interface. Move session snapshots off stream
-namespaces to DynamoDB+S3 (gap 2, Fix A) — this is Phase 1 work, not a later optimization.
+to prove the design against a fixed `Runtime` interface. Delete the legacy `eve.session`
+stream branch from `durable-session-store.ts`; whether snapshots also move to DynamoDB+S3
+in this phase is spike 3's call, not a given (gap 2, Fix A).
 Build the event log with an explicit replay-idempotency scheme, and the hook-token index
 with a park/retry policy for the deliver-before-mapping race. Rewrite `workflow-entry.ts` /
 `turn-workflow.ts` / `workflow-steps.ts` against `DurableContext`, keeping
@@ -678,7 +781,7 @@ e2e workflow.
   - **Two concurrent deliveries**, asserting both are processed in arrival order and neither is lost — the failure the durable inbox exists to prevent.
   - **A type-fidelity round-trip** over the snapshot (`Date`, `Map`, `Set`, `Buffer`, URL `FilePart.data`) to catch serde degradation.
 
-  Then `eve dev` end-to-end against the weather fixture (`apps/fixtures/weather-fixture`), driving a real multi-turn conversation and confirming events stream and a HITL approval round-trips.
+  Then `eve dev` end-to-end against `apps/fixtures/weather-agent`, driving a real multi-turn conversation and confirming events stream and a HITL approval round-trips.
 - **Phase 2:** run an agent against a real Bedrock model id; confirm the compiled manifest carries correct context-window limits and that compaction triggers at the right threshold.
 - **Phase 3:** `e2e/fixtures/agent-tools-sandbox` locally against Docker, then a deployed MicroVM: create a session, write a file, let it idle into suspend, resume **within the 8-hour cap**, confirm the file survived. Then the case that actually matters — force expiry past the cap and confirm **cold rehydrate** recreates the sandbox and re-seeds files rather than erroring.
 - **Phase 4/5:** deploy the CDK stack to a test account and run `eve eval` against the Function URL — the same shape as today's `e2e-vercel.yml`, different target.

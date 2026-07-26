@@ -46,7 +46,11 @@ closure and needs no stable module identity, so that machinery gets **deleted, n
 | `nitro-step-entry.ts` (210) | hosted step entrypoint for the Vercel step function | replace with the durable-handler entry |
 | `eve-service-route-output.ts` (61) | `eve/__server.func` + `.well-known/workflow/` route prefixes | delete with the Build Output emitter |
 | `vercel-workflow-output.ts` (657) | emits one `.func` per workflow into `.vercel/output` | replace with a single durable-handler entry |
-| `authored-directive-prologue.ts` | guards the above | delete |
+| `build-queue.ts` | generic build serializer | delete with the directory (nothing else consumes it) |
+| `authored-directive-prologue.ts` *(in `internal/`, not `workflow-bundle/`)* | guards the above | delete |
+
+That is all 11 non-test files in `src/internal/workflow-bundle/`, plus the one guard that
+lives outside it.
 
 This is a net **simplification**, and it is the strongest argument that the user's
 instinct here is right.
@@ -101,10 +105,14 @@ connection-OAuth tokens) and resumes by token from an HTTP route
 and are not a lookup key.
 
 **Fix:** a DynamoDB `hooks` table keyed by eve token → `{callbackId, executionId, ttl}`.
-The durable function writes the mapping inside a step immediately after `createCallback()`;
 `deliver()` reads it and calls `SendDurableExecutionCallbackSuccess`. Contained entirely
 within `src/execution/hook-ownership.ts` and `session-delivery-hook.ts`, whose interfaces
 already isolate this.
+
+Prefer **`waitForCallback(name, submitter, config)`** over raw `createCallback()` for the
+write: the submitter runs as an SDK-managed step with retry semantics for free, which is
+exactly what persisting the token mapping needs. Writing it as a hand-rolled step after
+`createCallback()` means reimplementing that retry logic.
 
 **Race to handle:** `deliver()` can arrive over HTTP *before* the durable function has
 checkpointed the mapping — a fast follow-up message right after session start is enough.
@@ -149,24 +157,33 @@ The design must nail down four things, not just pick a scheme:
 3. **An explicit idempotency key** on every append — `(sessionId, attempt, seq)` is sufficient and lets a retried write be a no-op rather than a duplicate.
 4. **Defined client behavior.** On an attempt rollover the client sees a sequence discontinuity; it must reset to the new attempt's `startIndex` rather than treating the gap as loss. Duplicate `(attempt, seq)` pairs are dropped client-side. This is additive to the existing `?startIndex=` protocol — the wire format does not change, but `src/client/message-reducer.ts` needs the dedupe and rollover rules.
 
-### 3. No documented stop API — use a cancel callback, but it is not a full replacement
-`cancelRun` has no direct equivalent. eve already has a dedicated `{sessionId}:cancel`
-hook (`src/execution/turn-cancellation-control.ts`); make cancellation a callback
+### 3. Turn-cancel and session-terminate are different problems
+These need separating — an earlier draft of this plan conflated them and wrongly claimed
+no stop API exists.
+
+**Session terminate is solved.** Lambda exposes
+[`StopDurableExecution`](https://docs.aws.amazon.com/lambda/latest/api/API_StopDurableExecution.html)
+(API, CLI, boto3): the execution moves to terminal `STOPPED`, in-progress operations are
+terminated, and optional error details can be attached. `terminateSession()` maps to it
+directly — no callback machinery, and it is a genuine operational kill switch for wedged
+or runaway executions.
+
+**Turn cancel still needs the race**, because the session must *survive* — `Stop` kills the
+whole execution, which is exactly what a turn cancel must not do. eve already has the
+`{sessionId}:cancel` hook (`src/execution/turn-cancellation-control.ts`); make it a callback
 completion the turn races against.
 
-**Two unknowns that belong on the Phase 1 spike list**, because both are undocumented:
-whether the SDK supports *racing a callback against an in-flight step* at all, and what
-happens to the losing branch on replay. And the approach is structurally incomplete — an
-execution wedged before it reaches the race point is **unkillable**, since there is no stop
-API to fall back on. `terminateSession()` inherits the same hole. If racing turns out
-unsupported, the fallback is a cancellation flag checked at every step boundary, which
-bounds worst-case cancellation latency to one step rather than making it immediate.
+The one remaining unknown is narrower than it looked: whether the SDK supports racing a
+callback against an in-flight step, and what happens to the losing branch on replay. If
+racing proves unsupported, the fallback — a cancellation flag checked at each step boundary,
+bounding worst-case latency to one step — only has to cover **turn** cancel, since terminate
+has a real API behind it.
 
 ### 4. Lambda is request-scoped — long-lived-process assumptions break
 Audit these; each currently assumes a process that outlives a request:
 
 - **Nitro `scheduledTasks`** (`src/internal/nitro/host/schedule-task-routes.ts`) — the in-process cron scheduler cannot run on Lambda. → EventBridge Scheduler (below).
-- **`event.waitUntil()`** (`src/internal/nitro/routes/channel-dispatch.ts`) — post-ack work is drained before the Lambda freezes. Slack-style "ack fast, work after" must instead async-invoke the durable function. This is a behavioral change worth calling out in docs.
+- **`waitUntil`** — see below; this is a public API decision, not an audit item.
 - **Per-session MCP connection registry** (`src/runtime/connections/registry.ts`) — already per-session and `dispose()`d, so it is fine, but it now reconnects per step rather than per process. Watch OAuth token cache churn in `scoped-authorization.ts`.
 - **Sandbox `shutdown()`** — must become *suspend*, not terminate, and **nothing currently triggers it** (see below).
 - **NDJSON response streaming** caps at the Lambda 15-minute limit; client reconnect with `startIndex` covers longer sessions.
@@ -185,7 +202,25 @@ connected tail client pins one HTTP-Lambda concurrent execution for up to 15 min
 while long-polling DynamoDB. Idle sessions with an open stream are not free the way they
 were on Vercel.
 
-### 6. Payload ceilings
+### 6. `waitUntil` — a public API semantic to decide once
+`waitUntil` is **not** an internal detail. It sits on the public `ChannelRouteContext`
+(`src/channel/routes.ts:40`) and is used by **nine built-in channels** — Slack, Discord,
+Telegram, Teams, Twilio, GitHub, Linear, chat-sdk — plus `schedule-task.ts` and
+`channel-dispatch.ts`. The Slack docs explicitly promise `ctx.waitUntil(...)` for detached
+work. Any authored channel may use it.
+
+So "async-invoke the durable function instead" is not a sufficient answer: it covers
+starting agent work, but not arbitrary authored post-ack work — posting a Slack
+acknowledgment after the 3-second ack deadline is the canonical example, and that is not a
+durable invocation.
+
+**Decision: keep the API and reimplement it natively.** Under `RESPONSE_STREAM` (which
+gap 5 already requires) the handler keeps executing after the response stream closes, until
+the handler promise resolves. So `waitUntil` becomes *"close the response, then drain
+pending promises before returning."* Semantics are preserved for every existing channel and
+for authored code; the cost is billed duration, bounded by the 15-minute limit. Document
+that bound — it is the one real behavioral difference from Vercel, where post-ack work was
+not billed against the request.
 Async `Invoke` — the session-start path — caps at **256 KB**, versus 6 MB for sync.
 `start()` today carries serialized context including the bundle source descriptor and the
 initial delivery payload, so this is a live constraint, not a theoretical one.
@@ -287,7 +322,11 @@ not an API key. Delete `src/internal/gateway.ts`, `src/internal/runtime-model.ts
 `src/setup/boxes/{detect-ai-gateway,apply-ai-gateway-credential}.ts`); `WiringMode`
 in `src/setup/state.ts:101` collapses to a single mode.
 `DEFAULT_AGENT_MODEL_ID` → a **concrete** Bedrock inference-profile id, not a wildcard.
-Recommended: `us.anthropic.claude-sonnet-5`. That prefix is a deliberate choice with
+Candidate: `us.anthropic.claude-sonnet-5` — **but verify the exact string against what
+`@ai-sdk/amazon-bedrock` actually accepts before it lands.** Bedrock's Converse-path model
+ids have historically carried version suffixes (`…-v1:0`), while the suffix-free form is the
+newer Messages-API path; picking the wrong one fails at first invocation. The `us.` prefix
+is a deliberate choice with
 consequences to document at the same time — `us.` is a *cross-Region* inference profile
 that may route requests to any US region, which is a data-residency decision, not just a
 routing detail. It also changes the IAM shape: the execution role needs
@@ -316,9 +355,18 @@ Maps cleanly onto the existing `SandboxBackend` interface
 | `SandboxBackend` | MicroVM |
 |---|---|
 | `prewarm({templateKey, bootstrap, seedFiles})` | zip Dockerfile+seed → S3 → create MicroVM image (snapshot); `templateKey` → image id |
-| `create({sessionKey, existingMetadata})` | `run-microvm` from snapshot, or `resume-microvm` when metadata holds a suspended id |
+| `create({sessionKey, existingMetadata})` | `run-microvm` from snapshot, `resume-microvm` when metadata holds a live suspended id, **or cold-rehydrate when it has expired** |
 | `captureState()` | `{ microVmId, endpoint }` |
-| `shutdown()` | **`suspend-microvm`**, not terminate — memory+disk preserved, sessions reattach |
+| `shutdown()` | **`suspend-microvm`**, not terminate — memory+disk preserved, sessions reattach *within the cap* |
+
+**Suspended state is capped at 8 hours, not "days".** MicroVM state preservation and total
+MicroVM lifetime both top out around 8 hours, and `idlePolicy.suspendedDurationSeconds`
+auto-terminates after a configured suspended duration. eve's durable sessions can idle far
+longer than that, so:
+
+- **`create({existingMetadata})` must handle resume-not-possible as a normal path, not an error.** A session idle past the cap comes back to a dead sandbox and needs **cold rehydrate**: recreate from the snapshot image and re-seed files. This is arguably the harder half of the lifecycle work and was missing from this plan entirely. Note eve's sandbox contract already says sessions are keyed per durable session and survive redeploys — that promise now has a time bound, and the rehydrate path is what keeps it honest.
+- **Docs must say sandbox state is not durable across long idle periods.** Files written by the agent do not survive an 8-hour gap. Anything that must persist belongs outside the sandbox.
+- **The upside:** the cap makes the leaked-MicroVM concern below self-limiting. With `idlePolicy` auto-terminate configured, a sandbox eve forgets about cleans itself up — a strong argument for the lifecycle-policy option over an eve-side sweeper.
 
 **Nothing triggers `shutdown()` on Lambda.** Today suspension rides on
 `src/internal/nitro/host/sandbox-shutdown-plugin.ts`, which hooks `SIGINT`/`SIGTERM` and
@@ -343,7 +391,7 @@ so a token that leaks or over-scopes is a direct cross-tenant code-execution pat
 
 - **Where JWE tokens are minted and stored.** Mint in the app runtime, never inside the sandbox. Persist a *reference* in session state, not the token itself — the same rule `src/runtime/connections/scoped-authorization.ts` already applies to connection tokens.
 - **What each token binds to** — account, function, session id, and the single permitted port. A token valid for any session in the account is not acceptable.
-- **Expiry and rotation.** Sessions can idle for days across suspend/resume, so tokens will outlive their validity; the reattach path must re-mint rather than replay a stored token.
+- **Expiry and rotation.** Sessions idle across suspend/resume up to the 8-hour cap, so tokens will outlive their validity; the reattach path must re-mint rather than replay a stored token, and the cold-rehydrate path mints fresh.
 - **Revocation** on session termination, and on backend switch (`SandboxBackendSessionState.backendName` mismatch).
 - **Rejection rules** — the in-image agent must reject any request whose token does not bind to its own session, so a leaked endpoint URL alone is not sufficient to reach it.
 `defaultSandbox()` probe chain (`src/public/sandbox/backends/default.ts`) becomes
@@ -390,6 +438,14 @@ Optionally add `eve deploy` back later as a thin `cdk deploy` wrapper.
 **recommended** — drop them from phase 1 and keep only the standalone Nitro/Lambda deployment;
 they are the least load-bearing surface and the most Vercel-shaped. `apps/frameworks/sveltekit`'s
 `@sveltejs/adapter-vercel` goes with them.
+**`apps/templates` and `apps/docs` need the same explicit call.** 71 files under `apps/`
+mention Vercel, including `apps/templates/web-chat-next` (README and agent channel config)
+— and templates scaffold the very deploy story Phase 0 deletes. Left alone, `eve init`
+generates projects pointing at a workflow that no longer exists, which is worse than
+generating nothing. Decide keep/rewrite/drop per template alongside the framework
+integrations; `apps/docs` (including `registry.json`) carries the same Vercel-shaped
+assumptions.
+
 Rename: `@vercel/eve-catalog` workspace package, `ghcr.io/vercel/eve` image, the
 `vercel-sandbox` OS user in the root `Dockerfile`, and the repo URL in
 `packages/eve/package.json`. Drop `@vercel/oidc`, `@vercel/sandbox`, `@vercel/sdk`,
@@ -437,7 +493,7 @@ can invalidate a load-bearing design choice:**
 
 1. Can `LocalDurableTestRunner` start a TypeScript execution **without awaiting** it to completion? Gates the entire local-dev story.
 2. Does `nitro@3.0.260610-beta`'s `aws-lambda` preset support `streamifyResponse` / `RESPONSE_STREAM`? Gates incremental NDJSON delivery — without it the streaming UX is dead on arrival.
-3. Can a callback be **raced against an in-flight step**, and what happens to the losing branch on replay? Gates cancellation.
+3. Can a callback be **raced against an in-flight step**, and what happens to the losing branch on replay? Gates *turn* cancel only — session terminate has `StopDurableExecution` behind it.
 4. What does a full session snapshot actually cost per step in checkpoint bytes? Gates whether S3 offload is required immediately (it probably is).
 
 Then define the `DurableBackend` seam and land the **`local` backend first** — it keeps
@@ -475,7 +531,7 @@ Rewrite `docs/guides/deployment/**`, `docs/sandbox.mdx`, `docs/schedules.mdx`,
 - **Phase 0:** `pnpm build && pnpm typecheck && pnpm test` all green; `pnpm guard:invariants` passes; `grep -ri vercel packages/eve/src` returns only intentional leftovers.
 - **Phase 1:** the tightest signal is `LocalDurableTestRunner`-backed integration tests over `workflow-runtime.ts`'s `Runtime` interface — start a session, deliver a message, tail NDJSON with `startIndex`, cancel a turn, resume after a simulated interruption. Then `eve dev` end-to-end against the weather fixture (`apps/fixtures/weather-fixture`), driving a real multi-turn conversation and confirming events stream and a HITL approval round-trips.
 - **Phase 2:** run an agent against a real Bedrock model id; confirm the compiled manifest carries correct context-window limits and that compaction triggers at the right threshold.
-- **Phase 3:** `e2e/fixtures/agent-tools-sandbox` locally against Docker, then a deployed MicroVM: create a session, write a file, let it idle into suspend, resume, confirm the file survived.
+- **Phase 3:** `e2e/fixtures/agent-tools-sandbox` locally against Docker, then a deployed MicroVM: create a session, write a file, let it idle into suspend, resume **within the 8-hour cap**, confirm the file survived. Then the case that actually matters — force expiry past the cap and confirm **cold rehydrate** recreates the sandbox and re-seeds files rather than erroring.
 - **Phase 4/5:** deploy the CDK stack to a test account and run `eve eval` against the Function URL — the same shape as today's `e2e-vercel.yml`, different target.
 
 ## Open risks
@@ -486,4 +542,4 @@ Rewrite `docs/guides/deployment/**`, `docs/sandbox.mdx`, `docs/schedules.mdx`,
 4. **MicroVM API maturity.** It is new; confirm the JS SDK surface, per-account MicroVM quotas, and image build times before committing Phase 3's schedule.
 5. **The local runner is a test harness doing a dev-runtime job.** It is the right call — it is the only credential-free, container-free option — but it is not what AWS designed it for. Undocumented limits (max invocations per runner, concurrent executions, payload ceilings) may surface only under a real `eve dev` session. The Phase 1 spike and the `DurableBackend` seam exist to keep that discovery cheap.
 6. **Streaming concurrency cost.** Under `RESPONSE_STREAM`, each connected tail client pins one HTTP-Lambda concurrent execution for up to 15 minutes while long-polling DynamoDB. At even modest concurrent-session counts this dominates the compute bill and can hit account concurrency limits — model it before committing to long-poll over a push transport.
-7. **Unkillable executions.** With no stop API, an execution wedged before it reaches the cancel race cannot be terminated (gap 3). Worth confirming whether Lambda exposes *any* administrative stop before accepting this.
+7. **Sandbox state has an 8-hour ceiling.** Agent-written files do not survive a longer idle gap, so the cold-rehydrate path is load-bearing, not a fallback. Any agent workflow that assumes a persistent workspace across days needs external storage — a user-visible semantic change from Vercel Sandbox that belongs in the docs, not just the code.

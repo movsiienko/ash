@@ -26,10 +26,21 @@ This document is the "what needs to change" assessment plus an execution order.
 Confirmed by grep: zero occurrences of either directive anywhere in `apps/`, `e2e/`,
 or `docs/`. **The durable-execution layer is effectively framework-internal.** Swapping
 `@workflow/core` for the AWS SDK touches no agent directory, tool, channel, skill, or
-schedule. The one exception: `experimental.workflow.world`
-(`src/shared/agent-definition.ts:230`) is a public — if experimental — authoring surface,
-and deleting it *is* a technical authoring-API break. Per repo rules that warrants a
-`minor` changeset. It is the only one.
+schedule.
+
+**The wider public surface does break, though, and the changeset must enumerate it.** An
+earlier draft called `experimental.workflow.world` "the only one"; that was wrong. Removed
+or changed public exports include:
+
+- `experimental.workflow.world` (`src/shared/agent-definition.ts:230`)
+- `vercelOidc()` and `vercelSubject` from `eve/channels/auth`, and `vercelOidc()` from `eve/agents/auth`
+- the `eve/sandbox/vercel` export and `ClientAuth.vercelOidc`
+- `withEve` plus the Nuxt and SvelteKit integrations, if those are dropped rather than rewritten
+- `eve deploy` / `eve link` CLI commands
+- **`OutboundAuthFn`'s signature**, which SigV4 forces to widen (see Auth), and `AuthFn`'s if inbound SigV4 is supported
+
+A `minor` changeset remains right, but it must describe every removed surface and ship
+migration notes — not a one-line mention.
 
 The corollary is better than a port: most of `src/internal/workflow-bundle/`
 (**4,236 non-test lines**) exists *only* to synthesize durable entrypoints out of
@@ -95,32 +106,38 @@ Two Lambda bundles from one compiled artifact set, instead of Vercel's N-functio
 
 The AWS SDK covers most of what eve needs (`step`, `wait`, `waitForCondition`,
 `createCallback`/`waitForCallback`, `invoke`, `parallel`, `map`, `runInChildContext`,
-1-year executions, free waits). Six things it does **not** give you:
+1-year executions, free waits). Seven things it does **not** give you:
 
-### 1. Hook tokens vs. AWS-generated callback IDs — needs an index table
+### 1. Reusable hooks vs. single-completion callbacks — needs a durable inbox
 eve mints its own hook tokens (`"<completionToken>:inbox"`, `"<sessionId>:cancel"`,
 connection-OAuth tokens) and resumes by token from an HTTP route
 (`resumeHook(token, payload)` in `src/execution/workflow-runtime.ts`).
 `createCallback()` returns an **AWS-generated** `callbackId`; names are observability-only
 and are not a lookup key.
 
-**Fix:** a DynamoDB `hooks` table keyed by eve token → `{callbackId, executionId, ttl}`.
-`deliver()` reads it and calls `SendDurableExecutionCallbackSuccess`. Contained entirely
-within `src/execution/hook-ownership.ts` and `session-delivery-hook.ts`, whose interfaces
-already isolate this.
+**A token→callbackId index alone does not work.** `SessionDeliveryHook`
+(`src/execution/session-delivery-hook.ts:22`) is a **reusable multi-message iterator** —
+`consumeNext()` / `next(): Promise<IteratorResult<HookPayload>>`, constructed over
+`bufferedDeliveries`, coalescing concurrent deliveries into one logical hook. An AWS
+callback completes **once**. Map a stable eve token onto one callback and two simultaneous
+deliveries race to complete it: one wins, the other errors or is silently lost. Retrying a
+missing mapping does not fix this — the semantics are simply different.
 
-Prefer **`waitForCallback(name, submitter, config)`** over raw `createCallback()` for the
-write: the submitter runs as an SDK-managed step with retry semantics for free, which is
-exactly what persisting the token mapping needs. Writing it as a hand-rolled step after
-`createCallback()` means reimplementing that retry logic.
+**Fix: a durable inbox, with callbacks demoted to wake-up signals.**
 
-**Race to handle:** `deliver()` can arrive over HTTP *before* the durable function has
-checkpointed the mapping — a fast follow-up message right after session start is enough.
-`resumeHook` needs an explicit park/retry-with-backoff policy on a missing token rather
-than a 404. This compounds open-risk #3: if single-completion callbacks force
-one-callback-per-delivery, the mapping churns every turn while the client keeps presenting
-the same stable eve token, so the index is written on the hot path and the race recurs
-per turn rather than once per session.
+- DynamoDB inbox keyed by `(sessionId, deliveryId)`; `deliver()` does a **conditional write** on `deliveryId` — that is also the delivery idempotency key, so client retries collapse naturally.
+- After enqueuing, `deliver()` completes the current wake-up callback. A completion that loses a race is harmless: the message is already durable in the inbox.
+- The durable function **atomically drains** the inbox on wake, processes everything queued, then arms a fresh callback. This reproduces the buffer-and-coalesce behavior the iterator provides today.
+- The token index (`token → {callbackId, executionId, ttl}`) still exists, but only to find the *current* wake-up callback — losing the race to a stale one no longer loses a message.
+
+Use **`waitForCallback(name, submitter, config)`** rather than raw `createCallback()`: the
+submitter runs as an SDK-managed step, so persisting the mapping gets retry semantics for
+free instead of hand-rolled.
+
+**Residual race:** `deliver()` can still arrive before the first mapping is checkpointed.
+With the inbox this degrades gracefully — the write lands, and the execution drains it on
+its next wake — but `resumeHook` should still back off and retry rather than 404 when no
+callback is armed yet.
 
 ### 2. No run streams — and they are the session *persistence substrate*, not just a tail
 This is bigger than it first looks. Workflow streams serve two distinct jobs:
@@ -155,7 +172,12 @@ The design must nail down four things, not just pick a scheme:
 1. **Sequence allocation is atomic.** Either a DynamoDB `UpdateItem` `ADD` on a per-session counter item, or a conditional `PutItem` on `attribute_not_exists(seq)` with retry on collision. Never read-then-write.
 2. **Attempt-scoped keys.** `(sessionId, attempt, seq)`, with the tail following the highest attempt. Preferred over truncate-on-retry: it is a single conditional write, and it preserves superseded attempts for debugging replay divergence — exactly the failure this design is most likely to hit.
 3. **An explicit idempotency key** on every append — `(sessionId, attempt, seq)` is sufficient and lets a retried write be a no-op rather than a duplicate.
-4. **Defined client behavior.** On an attempt rollover the client sees a sequence discontinuity; it must reset to the new attempt's `startIndex` rather than treating the gap as loss. Duplicate `(attempt, seq)` pairs are dropped client-side. This is additive to the existing `?startIndex=` protocol — the wire format does not change, but `src/client/message-reducer.ts` needs the dedupe and rollover rules.
+4. **Defined client behavior — and this *does* change the stream protocol.** An earlier draft claimed the wire format was unaffected. It is not. `followStreamIterable` (`src/client/open-stream.ts:100`) tracks a single integer `startIndex` advanced per received event; events carry no attempt or generation identifier, and the reducer never sees response metadata. As written, the client cannot detect a rollover, discard superseded events, or reset its cursor. Required: a **generation-aware cursor** — either a composite `(attempt, seq)` cursor on the wire, or an explicit attempt-boundary event the reducer can act on. Superseded events are dropped client-side; duplicates are idempotent on `(attempt, seq)`.
+
+**Open sub-problem: where does the attempt id come from?** TypeScript's `StepContext` does
+not expose the current retry attempt, so eve cannot simply read it. Options are an
+eve-allocated monotonic attempt counter checkpointed at step entry, or deriving generation
+from the execution's checkpoint position. Settle this in Phase 1 — the whole scheme rests on it.
 
 ### 3. Turn-cancel and session-terminate are different problems
 These need separating — an earlier draft of this plan conflated them and wrongly claimed
@@ -221,12 +243,22 @@ pending promises before returning."* Semantics are preserved for every existing 
 for authored code; the cost is billed duration, bounded by the 15-minute limit. Document
 that bound — it is the one real behavioral difference from Vercel, where post-ack work was
 not billed against the request.
-Async `Invoke` — the session-start path — caps at **256 KB**, versus 6 MB for sync.
-`start()` today carries serialized context including the bundle source descriptor and the
-initial delivery payload, so this is a live constraint, not a theoretical one.
-Callback-completion payloads (deliveries carrying attachments) have their own limits.
-Needs an S3-offload convention with a size check at the boundary — the same S3 pointer
-mechanism Fix A above introduces for snapshots.
+
+### 7. Payload ceilings, and start/delivery idempotency
+Async `Invoke` caps at **1 MB** — [raised from 256 KB in October 2025](https://aws.amazon.com/about-aws/whats-new/2025/10/aws-lambda-payload-size-256-kb-1-mb-invocations)
+— versus 6 MB sync. An earlier draft said 256 KB; the S3-offload conclusion stands, but any
+sizing analysis built on that number was wrong. Note the pricing edge: payloads above
+256 KB bill an extra request per 64 KB chunk, so offloading is a cost decision as well as a
+limit one. `start()` carries serialized context including the bundle source descriptor and
+the initial delivery payload — use the same S3 pointer mechanism Fix A introduces for
+snapshots, with a size check at the boundary.
+
+**Starts need an idempotency key too.** Async invocation plus client retries will otherwise
+open duplicate durable sessions for one logical session. Lambda provides
+[execution-name idempotency](https://docs.aws.amazon.com/lambda/latest/dg/durable-execution-idempotency.html)
+for exactly this: preallocate the eve session id and pass it as the durable execution name,
+so a retried start is a no-op rather than a second session. Deliveries get the equivalent
+via the conditional inbox write on `deliveryId` (gap 1).
 
 ---
 
@@ -245,7 +277,25 @@ written against it and should not change — but its implementation swaps:
 | `resumeHook(token, payload)` | token index lookup → `SendDurableExecutionCallbackSuccess` |
 | `getRun(id).getReadable({startIndex})` | DynamoDB event-log tail |
 | `cancelRun(id)` | complete the cancel callback |
-| `shouldRouteToLatestDeployment()` (`VERCEL_ENV`) | Lambda alias routing — delete the function |
+| `shouldRouteToLatestDeployment()` (`VERCEL_ENV`) | **not** a plain alias swap — see below |
+
+**Preserve per-turn latest-deployment routing deliberately.** Today the long-lived session
+driver stays pinned while *each turn* starts against the latest deployment —
+`turnWorkflowReference` exists precisely so
+`start(turnWorkflowReference, args, { deploymentId: "latest" })` reaches the newest turn
+workflow even when the driver is older (`workflow-runtime.ts:95`). Lambda does **not** give
+this for free: per the
+[invocation docs](https://docs.aws.amazon.com/lambda/latest/dg/durable-invoking.html),
+*"When you update an alias, new executions use the new version, while in-progress executions
+continue with their original version."* A single long-lived durable execution is pinned at
+start, so a days-long session would run stale code forever.
+
+Keep the behavior by dispatching **each turn as its own durable invocation through the
+alias** — `context.invoke(name, aliasArn, payload)` chained from the driver, which
+checkpoints the result and resumes without re-invoking. New turns then pick up new
+deployments while the driver stays pinned, matching today's semantics. `StopDurableExecution`
+also becomes per-turn granular, which is a bonus for turn cancel. If this is not done, the
+regression must be stated explicitly rather than left implicit.
 
 Keep the **snapshot format** and `durable-session-migrations/` — both are platform-neutral
 and the versioning is worth preserving. But `durable-session-store.ts` itself must be
@@ -308,9 +358,13 @@ which is the main reason to introduce it.
 `"vercel" | undefined`; change it to return `"aws-lambda"` unconditionally and drop the
 `process.env.VERCEL` probe. Build emits two entries: the Nitro handler and the
 durable handler. Function URL invoke mode must be `RESPONSE_STREAM` (gap 5). Replace `vercel-build-output-config.ts` / `build-vercel-agent-summary.ts`
-with a **deploy manifest** (`.eve/aws-manifest.json`: function entries, cron expressions,
-env requirements, table names, MicroVM image ids) — this is the CDK contract and is the
-natural successor to the Vercel dashboard summary. Delete `cron-handler-route.ts`,
+with a **deploy manifest** (`.eve/aws-manifest.json`) — the CDK contract, and the natural
+successor to the Vercel dashboard summary. It must declare **logical resources and content
+hashes**, not concrete deployment-created identifiers: function entries, cron expressions,
+required env, logical table *roles* (`hooks`, `events`, `snapshots`), and a sandbox image
+content hash. Physical table names and MicroVM image ids are created by CDK at deploy time,
+so baking them into a build artifact inverts the dependency and makes builds
+environment-specific. Delete `cron-handler-route.ts`,
 `vercel-build-prewarm.ts`.
 
 ### Models — Bedrock
@@ -414,14 +468,33 @@ do not sign SigV4. **Decision: direct Lambda invoke with a synthesized event.** 
 consequence to carry forward: the unguessable-cron-path secret from `cron-handler-route.ts`
 is redundant under IAM auth and should be dropped rather than ported.
 
-### Auth
-Delete `vercelOidc()` from `src/public/channels/auth.ts` and `src/public/agents/auth.ts`,
-plus `src/runtime/governance/auth/vercel-oidc-project.ts` and `src/shared/vercel-project.ts`.
-Add a **SigV4** authenticator for the framework default
-(`src/runtime/framework-channels/index.ts:22` currently `[vercelOidc(), localDev()]`
-→ `[sigv4(), localDev()]`), matching Function URL `AWS_IAM` auth; SigV4 signing also
-covers agent→agent calls (`src/execution/remote-agent-dispatch.ts`). The existing
-`oidc()`/`jwtEcdsa()`/`jwtHmac()`/`httpBasic()` strategies are already generic and cover Cognito.
+### Auth — needs two surfaces, and two interface changes
+An earlier draft proposed a single `AWS_IAM` Function URL with a `sigv4()` framework
+default. **That does not work** and the topology must be settled before implementation.
+
+`AWS_IAM` requires *every* request to be SigV4-signed. Slack, GitHub, Twilio, Discord,
+Telegram, and Teams webhooks cannot sign; neither can a browser holding a bearer token, nor
+an OAuth provider redirecting to a connection callback. A single IAM-authed URL locks out
+most of eve's inbound traffic.
+
+**Topology: two surfaces.**
+
+| Surface | Auth | Carries |
+|---|---|---|
+| Public (Function URL `NONE`, or API Gateway) | eve's own `routeAuth` chain — per-channel HMAC verification, `oidc()`, `jwtEcdsa()`, `httpBasic()` | browser clients, channel webhooks, OAuth callbacks |
+| Internal | `AWS_IAM` | agent→agent calls, EventBridge, internal invokes |
+
+The existing `oidc()` / `jwtEcdsa()` / `jwtHmac()` / `httpBasic()` strategies are already
+generic and cover Cognito, so the public surface is well served today. Each channel's
+`verify.ts` already does constant-time signature verification — that is the real webhook
+authentication and it is unchanged. Delete `vercelOidc()` from
+`src/public/channels/auth.ts` and `src/public/agents/auth.ts`, plus
+`src/runtime/governance/auth/vercel-oidc-project.ts` and `src/shared/vercel-project.ts`.
+
+**Two public interfaces must change**, and both are breaking:
+
+1. **`AuthFn<TEvent = Request>`** (`src/public/channels/auth.ts:495`) receives only the request. Lambda validates SigV4 itself and exposes the caller principal at `requestContext.authorizer.iam` — unreachable through a bare `Request`. A `sigv4()` inbound strategy needs the authorizer context threaded into the auth surface.
+2. **`OutboundAuthFn = () => Promise<{ headers }>`** (`src/public/agents/auth.ts:11`) receives no method, URL, or body. **SigV4 signs over all three**, so agent→agent SigV4 is impossible without widening this signature. This blocks the internal surface, not just a nicety.
 
 ### CLI and setup
 `eve deploy` and `eve link` (`src/cli/commands/register-project-commands.ts`) are already
@@ -488,13 +561,16 @@ Vercel-shaped output — that combination is untested and may not survive contac
 **Phase 1 — Durable execution on Lambda. *The long pole.***
 Vendor `@aws/durable-execution-sdk-js`.
 
-**Spike these four before writing anything — together they are days, not weeks, and each
-can invalidate a load-bearing design choice:**
+**Two earlier spikes are already resolved by documentation — do not re-budget them:**
 
-1. Can `LocalDurableTestRunner` start a TypeScript execution **without awaiting** it to completion? Gates the entire local-dev story.
-2. Does `nitro@3.0.260610-beta`'s `aws-lambda` preset support `streamifyResponse` / `RESPONSE_STREAM`? Gates incremental NDJSON delivery — without it the streaming UX is dead on arrival.
-3. Can a callback be **raced against an in-flight step**, and what happens to the losing branch on replay? Gates *turn* cancel only — session terminate has `StopDurableExecution` behind it.
-4. What does a full session snapshot actually cost per step in checkpoint bytes? Gates whether S3 offload is required immediately (it probably is).
+- ~~Can `LocalDurableTestRunner` start an execution without awaiting it?~~ **Yes.** The testing docs show `runner.run()` retained as a promise while callbacks are completed concurrently. The local-dev story stands.
+- ~~Does the pinned Nitro support response streaming?~~ **Yes.** The `aws-lambda` preset ships `aws-lambda-streaming.mjs` over `awslambda.streamifyResponse`, enabled by `awsLambda: { streaming: true }`.
+
+**Three real unknowns remain:**
+
+1. Can a callback be **raced against an in-flight step**, and what happens to the losing branch on replay? Gates *turn* cancel only — session terminate has `StopDurableExecution` behind it.
+2. What does a full session snapshot cost per step in checkpoint bytes? Gates how aggressive the S3 offload threshold must be.
+3. **How is the stream attempt id allocated?** `StepContext` does not expose the retry attempt, so the generation-aware cursor (gap 2) needs an eve-owned scheme. This one is on the critical path for the client protocol change.
 
 Then define the `DurableBackend` seam and land the **`local` backend first** — it keeps
 `eve dev` and the test tiers working throughout the rewrite, and it is the cheapest place
@@ -520,9 +596,19 @@ In-image agent server first (it is the blocker), then the backend against the ex
 **Phase 4 — Schedules, auth, deploy manifest.**
 EventBridge Scheduler, SigV4 authenticator, `.eve/aws-manifest.json`, and the CDK stack.
 
-**Phase 5 — e2e and docs.**
-Rewrite `docs/guides/deployment/**`, `docs/sandbox.mdx`, `docs/schedules.mdx`,
-`docs/concepts/execution-model-and-durability.md`. New CI e2e workflow.
+**Phase 5 — residual docs and e2e consolidation.**
+Whatever cross-cutting narrative is left after the per-phase work below: the deployment
+guides as a set, `docs/concepts/execution-model-and-durability.md`, and the consolidated CI
+e2e workflow.
+
+> **Docs and e2e do not belong in a trailing phase.** `AGENTS.md` requires public-behavior
+> changes to update docs *in the same PR*, so deferring all of `docs/**` to Phase 5 violates
+> the repo's own rules. Each phase above carries its own docs: Phase 1 owns
+> `execution-model-and-durability.md`, Phase 2 the model docs, Phase 3 `sandbox.mdx`
+> (including the 8-hour contract), Phase 4 `schedules.mdx` and auth. Likewise **Phase 4 is
+> not done until a deployed AWS e2e exercises IAM, callbacks, DynamoDB, streaming, and
+> EventBridge together** — the integration failures live in the seams between them, and no
+> amount of local testing finds those.
 
 ---
 

@@ -117,7 +117,7 @@ resource.
 
 The AWS SDK covers most of what eve needs (`step`, `wait`, `waitForCondition`,
 `createCallback`/`waitForCallback`, `invoke`, `parallel`, `map`, `runInChildContext`,
-1-year executions, free waits). Seven things it does **not** give you:
+1-year executions, free waits). Eight things it does **not** give you:
 
 ### 1. Reusable hooks vs. single-completion callbacks — needs a durable inbox
 eve mints its own hook tokens (`"<completionToken>:inbox"`, `"<sessionId>:cancel"`,
@@ -211,7 +211,8 @@ reserved session id → `STARTING` → execution's first checkpoint promotes to 
 Recovery matters as much as the happy path: a record stuck in `RESERVED`/`STARTING` past a
 timeout is swept and either re-invoked — safe, because the execution name is deterministic
 and idempotent — or failed. Async invocation can also drop or duplicate events, so configure
-a **DLQ** and reconcile from it rather than assuming delivery.
+a **DLQ**; the **same sweeper** consumes it, since a DLQ'd start and a stalled `RESERVED`
+record are the same condition reached by different routes.
 
 `deliver()` can then distinguish three states rather than two:
 
@@ -283,7 +284,7 @@ unbounded bill or a compliance finding:
 |---|---|
 | Inbox items | TTL below the checkpointed high-water mark |
 | Dedupe / tombstone records | must outlive the **longest provider retry window** (Slack, GitHub, Stripe all differ) — too short reopens duplicate delivery |
-| Event batches | stream retention after a session goes terminal; how long can a client still reconnect and tail? |
+| Event batches | **a stated retention window, not just a terminal-session rule.** "How far back can a client reconnect with `startIndex`?" is a **protocol promise**, the same way the 8-hour sandbox cap is. Unbounded retention is both a cost driver and an unbounded partition on a months-long session; bounded retention needs the window documented *and* a defined client behavior when its cursor falls below it. It also feeds rollover, since the event-log cursor is part of the handoff frontier. |
 | Token mappings | cleared on terminal session, but only after the old-token cutoff (rekey) |
 | Snapshots + unreferenced S3 objects | S3 lifecycle rules, plus periodic reconciliation against the session head to sweep objects a failed publish orphaned |
 
@@ -304,7 +305,10 @@ because `shouldCompact` (`src/harness/compaction.ts:59`) already bounds history 
 model's context window — eve must compact for the model regardless.
 
 **Fix B — the client tail becomes an event log.** This one *is* unavoidable. Append-only
-DynamoDB, long-polled by the HTTP Lambda. Keep it behind a narrow interface so
+DynamoDB, tailed by the HTTP Lambda. Note that "long-poll" is shorthand: DynamoDB does not
+push, so this is a **`Query` loop**, and its poll interval is a second user-visible cadence
+knob alongside the write-batching interval (point 4 below) — settle both together, since
+together they set perceived token latency. Keep it behind a narrow interface so
 Kinesis/AppSync Events/Momento can replace it later.
 
 **Appends must be idempotent under replay *and* safe under concurrency.** Tail events are
@@ -315,14 +319,15 @@ owned this; eve now owns it. A naive append-with-counter **breaks under replay**
 read-then-increment counter also races when a parent execution and a child session write
 concurrently.
 
-The design must nail down five things, not just pick a scheme:
+The design must nail down six things, not just pick a scheme:
 
 1. **Sequence allocation is atomic and gap-free.** Never read-then-write. As with the inbox, a bare `UpdateItem ADD` followed by a separate put lets a higher `seq` become visible before a lower one commits, so a reader advancing its cursor skips the gap permanently. Allocate a **range per flush** inside the same conditional write that publishes the batch (see 4), and have readers treat a missing `seq` as *not yet committed* rather than *absent*.
 2. **Attempt-scoped keys** — `(sessionId, attempt, seq)` — preserving superseded attempts rather than truncating on retry, so replay divergence stays debuggable. But see 3: attempt scoping alone is not an identity scheme.
 3. **A *stable logical* event id — `(sessionId, attempt, seq)` is not one.** A freshly allocated `seq` differs on retry, so it cannot deduplicate anything: the retried append gets a new number and lands twice. The id must be derivable from position in the logical event stream (segment + ordinal within segment), not from an allocation counter. Relatedly, "follow the highest attempt" hides the **completed prefix**: replay does not re-emit events from steps that already checkpointed, so a naive latest-attempt filter drops everything before the retried step. Supersession must be **suffix-scoped** — attempt N supersedes only events at or after the retry point, not the whole stream.
 
 4. **Batch the writes.** The append path is token-by-token during a model call, so per-token `PutItem` plus counter contention means hundreds to thousands of sequential DynamoDB round-trips *inside the step*, adding latency to every response and consuming real write capacity. Coalesce: flush every N milliseconds or N kilobytes, allocate `seq` in ranges rather than per event, one item per flush. This is a **user-visible tuning decision** — it sets the client-perceived token cadence, which is the entire reason the NDJSON tail exists — so pick the interval deliberately rather than inheriting it.
-5. **Defined client behavior — and this *does* change the stream protocol.** An earlier draft claimed the wire format was unaffected. It is not. `followStreamIterable` (`src/client/open-stream.ts:100`) tracks a single integer `startIndex` advanced per received event; events carry no attempt or generation identifier, and the reducer never sees response metadata. As written, the client cannot detect a rollover, discard superseded events, or reset its cursor. Required: a **generation-aware cursor** — either a composite `(attempt, seq)` cursor on the wire, or an explicit attempt-boundary event the reducer can act on. Duplicates are idempotent on `(attempt, seq)`.
+5. **Supersession happens at *two* granularities, not one.** Everything above concerns step retries inside one execution. But each turn is its own execution, so a failed and retried `CHAINED_INVOKE` re-runs the **entire turn** as a fresh execution — replaying its whole event stream and re-executing every side effect it had already performed before failing (risk 2 again, at turn scale). The generation-aware cursor must therefore span **executions**, not just attempts within one: a turn re-invoke is itself a supersession event. Deterministic per-turn execution names (gap 7) reduce how often this happens; they do not eliminate it.
+6. **Defined client behavior — and this *does* change the stream protocol.** An earlier draft claimed the wire format was unaffected. It is not. `followStreamIterable` (`src/client/open-stream.ts:100`) tracks a single integer `startIndex` advanced per received event; events carry no attempt or generation identifier, and the reducer never sees response metadata. As written, the client cannot detect a rollover, discard superseded events, or reset its cursor. Required: a **generation-aware cursor** — either a composite `(attempt, seq)` cursor on the wire, or an explicit attempt-boundary event the reducer can act on. Duplicates are idempotent on `(attempt, seq)`.
 
    **"Discard superseded events client-side" is not sufficient on its own**, and this is the
    deepest problem in the design. `runSession` yields each event the moment it arrives
@@ -420,6 +425,12 @@ already-detached work has nothing left to attach to. Semantics are preserved for
 existing channel and for authored code, because every current caller registers
 synchronously during request handling.
 
+One interaction worth documenting: on the **long-lived NDJSON tail route**,
+`responseStream.end()` happens only when the tail closes, so work registered there would
+drain up to 15 minutes late and inside the same billed window. Every real caller is a short
+webhook handler, so this is fine in practice — but state plainly that `waitUntil` is not
+for streaming routes.
+
 Two consequences to document, both real behavioral differences from Vercel:
 
 - **The drain is billed.** Post-ack work now counts against request duration and is bounded
@@ -474,6 +485,29 @@ entry point to a stable key:
 Without this, at-least-once webhook redelivery — which every one of these providers does by
 design — silently starts duplicate sessions. Deliveries use the same key as `deliveryId` in
 the inbox transaction (gap 1).
+
+**Per-turn invokes need deterministic execution names too — and they are far more frequent
+than session starts.** Each turn is its own execution; a retried `CHAINED_INVOKE` without a
+stable name starts a *duplicate turn*. Name them from `(sessionId, turnSeq)` so a retry
+attaches to the in-flight or completed execution instead of forking one.
+
+### 8. Step duration — a step must fit inside one invocation, and nothing bounds it
+This plan bounds payload *bytes* at every boundary and never bounds step *time*. A durable
+execution spans a year through checkpoint and replay, but **each invocation of the durable
+handler is still capped at 15 minutes**, and a `context.step` cannot checkpoint mid-flight —
+it must finish within the remaining budget of the invocation it started in.
+
+eve's steps are exactly the wrong shape for that: model calls (extended thinking runs 10+
+minutes), tool executions, and sandbox commands of unbounded duration. A step that reliably
+exceeds the remaining budget does not fail once — it becomes a **poison retry loop**:
+timeout, replay, re-run, timeout. That is worse than a clean failure, because it burns the
+operation budget and bills the whole time while never converging.
+
+Give this the same treatment as the payload ceilings:
+
+- **State a per-step time budget** and enforce it, rather than discovering it as a wedged session.
+- **Disposition long-running work explicitly.** Tool and sandbox executions that can exceed the budget belong behind a **callback against an external worker** — the sandbox already has its own compute — not inside the step.
+- **Measure replay overhead**, as a spike. Replay re-runs the handler from the beginning on every resume and consumes the *same* 15 minutes the step needs, so a session with thousands of checkpointed operations may have materially less than 15 minutes of usable budget. The ceiling tightens as the session ages, which is the opposite of the intuition.
 
 ---
 
@@ -681,7 +715,10 @@ not an API key. Delete `src/internal/gateway.ts`, `src/internal/runtime-model.ts
 `formatLanguageModelGatewayId()`, and the entire gateway setup flow
 (`src/setup/{ai-gateway-api-key,validate-gateway-key,gateway-models}.ts`,
 `src/setup/boxes/{detect-ai-gateway,apply-ai-gateway-credential}.ts`); `WiringMode`
-in `src/setup/state.ts:101` collapses to a single mode.
+in `src/setup/state.ts:101` collapses to a single mode. Include
+`buildGatewayAttributionHeaders` (`src/harness/tool-loop.ts:306`) in the sweep — it reads
+`VERCEL_PROJECT_PRODUCTION_URL`/`VERCEL_URL` and lives in the harness rather than the
+gateway files enumerated above, so it survives a file-scoped deletion as dead env probing.
 **Decision: there is no default model id. Delete `DEFAULT_AGENT_MODEL_ID` as a fallback.**
 Earlier drafts of this plan argued over *which* Bedrock id to make the default. Wrong
 question — on Bedrock a framework-chosen model id is a guess about someone else's account,
@@ -898,6 +935,20 @@ EventBridge Scheduler is deliberately in neither row: per the schedules section 
 the function directly through its own execution role and never reaches eve over HTTP, so it
 is governed by that role's `lambda:InvokeFunction` grant rather than by either URL's auth.
 
+**The public surface needs a throttling and concurrency-isolation decision.** A `NONE`
+Function URL bills and consumes account concurrency on **every request, before `routeAuth`
+runs** — and Function URLs support no WAF, no throttling, and no usage plans. Combined with
+risk 6 (each connected tail client pins a concurrent execution for up to 15 minutes), either
+an unauthenticated flood or merely organic tail concurrency can exhaust the account pool and
+**starve the durable handler**, which draws from that same pool. A wedged agent backend
+caused by public read traffic is exactly the failure to design out.
+
+Two decisions, both architecture rather than CDK detail: (a) **Function URL or API Gateway**
+for the public surface — the passing "(or API Gateway)" above needs resolving, and WAF plus
+throttling is a strong argument for the latter, as is the WebSocket question below;
+(b) **reserved concurrency on the durable handler** with a ceiling on the HTTP handler, so
+neither can starve the other.
+
 **WebSocket channels have no home in this topology.** `WS` is a public export
 (`src/public/definitions/channel.ts:28`), `ChannelRouteMethod` includes `"WEBSOCKET"`, and
 `docs/channels/custom.mdx:144` documents the full lifecycle contract (`upgrade`, `open`,
@@ -945,6 +996,23 @@ Optionally add `eve deploy` back later as a thin `cdk deploy` wrapper.
 **recommended** — drop them from phase 1 and keep only the standalone Nitro/Lambda deployment;
 they are the least load-bearing surface and the most Vercel-shaped. `apps/frameworks/sveltekit`'s
 `@sveltejs/adapter-vercel` goes with them.
+**Operator observability loses its home and gains no successor.** The deploy manifest
+replaces only the *build-time* Vercel dashboard summary. The runtime half — "why is session
+X wedged, what did turn N checkpoint, which callback is it parked on" — is answerable today
+in the Workflow dashboard and becomes, by default, raw `GetDurableExecutionHistory` calls
+and CloudWatch spelunking. For a framework whose entire premise is months-long durable
+sessions, debugging a stuck one is a first-class operator task, not an afterthought. Pick a
+disposition even if it is minimal: an `eve sessions inspect` CLI over
+`GetDurableExecution`/`GetDurableExecutionHistory` (cheapest, and the CLI already has the
+credential plumbing), a documented CloudWatch Logs Insights recipe, or an explicit "raw AWS
+APIs only" statement in the docs. The `DurableExecution*` CloudWatch metrics and the
+EventBridge status-change events are the raw material either way.
+
+**Cutover: existing Vercel sessions are abandoned.** Keeping the snapshot format and
+`durable-session-migrations/` is about preserving *version* continuity, not portability —
+say so plainly, because retaining that machinery otherwise implies live sessions migrate.
+Pre-1.0 hard fork makes abandonment defensible; leaving it ambiguous does not.
+
 **`apps/templates` and `apps/docs` need the same explicit call.** 71 files under `apps/`
 mention Vercel, including `apps/templates/web-chat-next` (README and agent channel config)
 — and templates scaffold the very deploy story Phase 0 deletes. Left alone, `eve init`
@@ -1011,6 +1079,8 @@ while callbacks complete concurrently. The local-dev story stands.
 2. **What does the parent observe when a per-turn child execution is stopped mid-flight?** The per-turn `context.invoke` design makes `StopDurableExecution` turn-granular, but the driver's checkpointed `invoke` operation sees *something* when its child is stopped — an error result, presumably. If the SDK retries a failed child invocation it would **resurrect a cancelled turn**, which is worse than not cancelling. Same feature as unknown 1; spike them together.
 3. **What does a full session snapshot cost per step, against which budget?** The service limits are documented — 256 KB per `STEP`, 1 MB per `CHAINED_INVOKE`, 100 MB and 3,000 operations per execution (gap 2) — so this no longer gates *whether* to externalize, and it is not a hunt for an unpublished ceiling. What is unmeasured is how much of each budget the durable SDK's own envelope consumes before eve's bytes: that sets the inline-vs-spill threshold for intra-turn step results and calibrates how close a busy session gets to the operation ceiling before rollover.
 4. **How is the stream attempt id allocated?** `StepContext` does not expose the retry attempt, so the generation-aware cursor (gap 2) needs an eve-owned scheme. On the critical path for the client protocol change.
+5. **How much of the 15-minute invocation budget does replay consume?** Gap 8's ceiling tightens as a session ages, and the answer sets the per-step time budget. Measure against a session with thousands of checkpointed operations, not a fresh one.
+6. **What is the deployable region set?** The **intersection** of durable functions ∩ Lambda MicroVMs ∩ the chosen Bedrock model ∩ EventBridge Scheduler — nobody has computed it. It gates the Bedrock geo-profile guidance directly (an `eu.` profile is moot if durable functions are not in EU regions yet), so it is a documentation output, not just an internal fact.
 
 **Phase 1 needs a real AWS gate, not just the local backend.** The CDK stack is scheduled in
 Phase 4, but the local runner cannot validate IAM, service quotas, callback races, alias
@@ -1115,7 +1185,7 @@ e2e workflow.
 1. **Durable-function payload/checkpoint costs.** eve checkpoints a full session snapshot per step (`durable-session-store.ts`), and metering bills per-operation *and* per-payload-byte. Externalizing snapshots to S3 (gap 2, Fix A) removes the ceiling risk and most of the cost; what remains is calibration — spike 3 sizes the inline-vs-spill threshold. The residual risk is **operation count**, not bytes: with rollover in place a session survives indefinitely, but rollover frequency is now a cost driver worth measuring under a realistic turn cadence.
 2. **Replayed side effects — the most dangerous item on this list.** "Put nondeterminism inside `context.step()`" is necessary but **not sufficient**: steps are **at-least-once**, so an interrupted step re-runs and repeats what it already did. eve's steps are full of externally-visible effects — adapter delivery to Slack/Discord/etc. (`workflow-steps.ts:225`), event-hook emission, tool execution, and **child agent session starts** (`childRuntime.run()` at `dispatch-runtime-actions-step.ts:145`). A retry can re-post a message, re-run a tool with real-world consequences, or spawn a duplicate subagent session. Every effect needs an explicit disposition: a **stable idempotency key**, **at-most-once** via a pre-committed intent record, or a documented **no-retry** step configuration. Auditing `src/harness/tool-loop.ts` for determinism is the smaller half; enumerating and classifying the side effects is the larger one, and it belongs in Phase 1 — not in production when a user gets two identical Slack messages.
 3. **Concurrent callback completion.** Addressed by the durable inbox (gap 1), but the pattern recurs for every reusable hook — see the hook inventory there.
-4. **MicroVM API maturity.** It is new; confirm the JS SDK surface, per-account MicroVM quotas, and image build times before committing Phase 3's schedule.
+4. **Service maturity across the whole stack, not just MicroVMs.** Lambda durable functions shipped at re:Invent 2025 — the SDK surface, the operation-limit table, and undocumented behaviors like callback racing are all months old and can shift under this plan. Confirm the MicroVM JS SDK surface, per-account quotas, and image build times before committing Phase 3's schedule; and re-verify the durable-function limits cited throughout this document at implementation time rather than trusting a snapshot taken during planning.
 5. **The local runner is a test harness doing a dev-runtime job.** It is the right call — it is the only credential-free, container-free option — but it is not what AWS designed it for. Undocumented limits (max invocations per runner, concurrent executions, payload ceilings) may surface only under a real `eve dev` session. The Phase 1 spike and the `DurableBackend` seam exist to keep that discovery cheap.
 6. **Streaming concurrency cost.** Under `RESPONSE_STREAM`, each connected tail client pins one HTTP-Lambda concurrent execution for up to 15 minutes while long-polling DynamoDB. At even modest concurrent-session counts this dominates the compute bill and can hit account concurrency limits — model it before committing to long-poll over a push transport.
 7. **Sandbox state has an 8-hour ceiling.** Agent-written files do not survive a longer idle gap, so the cold-rehydrate path is load-bearing, not a fallback. Any agent workflow that assumes a persistent workspace across days needs external storage — a user-visible semantic change from Vercel Sandbox that belongs in the docs, not just the code.

@@ -223,13 +223,19 @@ Three independent arguments, in increasing order of force:
 
 1. *Cost* — eve checkpoints a full snapshot per step; metering bills per-operation **and** per-payload-byte.
 2. *The 100 MB ceiling* — `DurableExecutionStorageWrittenBytes` is capped per execution, and inline snapshots consume it fastest.
-3. *Strongest: separate executions cannot share checkpoint state.* Each durable execution has its own checkpoint log that other executions cannot read. Since every turn is a **separate** execution dispatched via `context.invoke` (see the versioning section), the turn cannot reach the driver's checkpoints — session state must travel in the invoke payload. **Caveat, and it matters:** the 1 MB figure is the *ordinary async `Invoke`* limit; AWS describes durable `context.invoke()` as a distinct backend operation and does not publish that limit for it. Treat the exact ceiling as **unverified pending a deployed payload-size spike** (added below). The argument survives either way — some finite payload cap exists, and marshaling unbounded history through it is the wrong design — but do not cite 1 MB as established fact.
+3. *Strongest: separate executions cannot share checkpoint state.* Each durable execution has its own checkpoint log that other executions cannot read. Since every turn is a **separate** execution dispatched via `context.invoke` (see the versioning section), the turn cannot reach the driver's checkpoints — session state must travel in the invoke payload. **And that payload is capped by a documented limit, not an unknown one:** [`OperationUpdate`](https://docs.aws.amazon.com/lambda/latest/api/API_OperationUpdate.html) publishes a per-operation-type table — **1 MB for `CHAINED_INVOKE`**, which is what durable `context.invoke()` records, and for async `EXECUTION`; 6 MB for sync `EXECUTION`; and **256 KB for `CONTEXT`, `STEP`, `WAIT`, and `CALLBACK`**. An earlier draft of this plan called the `context.invoke()` ceiling unpublished. It is published; cite it.
 
 **Shape:** write snapshots to **unique or content-addressed** S3 keys, then **conditionally
 publish** the winner through a small DynamoDB **session head** record
 `{latestSnapshotKey, seq, fenceToken}` with a CAS on the expected `seq`/fence. Small
 intra-turn step results stay inline; only oversized ones spill. Invoke payloads carry
 `{sessionId, snapshotKey, seq}`.
+
+Note which ceiling actually binds where: the driver→turn payload has 1 MB to work with, but
+**step results have only 256 KB**, so the `STEP` limit — not the invoke limit — is what sets
+the inline-vs-spill threshold. The only thing left to measure is how much of each budget the
+durable SDK's own framing consumes before eve's bytes; that is a sizing spike, not a
+discovery one.
 
 > An earlier draft proposed overwriting a **deterministic** key per `(sessionId, turn, step)`
 > and claimed S3 PUT idempotency gave "exactly-once for free." **That is wrong on both
@@ -360,18 +366,44 @@ starting agent work, but not arbitrary authored post-ack work — posting a Slac
 acknowledgment after the 3-second ack deadline is the canonical example, and that is not a
 durable invocation.
 
-**Decision: keep the API and reimplement it natively.** Under `RESPONSE_STREAM` (which
-gap 5 already requires) the handler keeps executing after the response stream closes, until
-the handler promise resolves. So `waitUntil` becomes *"close the response, then drain
-pending promises before returning."* Semantics are preserved for every existing channel and
-for authored code; the cost is billed duration, bounded by the 15-minute limit. Document
-that bound — it is the one real behavioral difference from Vercel, where post-ack work was
-not billed against the request.
+**Decision: keep the API and reimplement it natively — but the implementation must await,
+never assume.** AWS is explicit that Lambda does **not** wait for unresolved promises once
+the handler returns or the response stream ends, and the Node.js 24 runtime made that
+uniform across buffered and streaming handlers
+([runtime announcement](https://aws.amazon.com/blogs/compute/node-js-24-runtime-now-available-in-aws-lambda/),
+[streaming docs](https://docs.aws.amazon.com/lambda/latest/dg/config-rs-write-functions.html)).
+So *"close the response, then let pending promises drain"* — what an earlier draft of this
+plan proposed — is not a semantic eve can lean on. Anything not awaited before the handler
+promise resolves is simply dropped when the environment freezes.
+
+`waitUntil` therefore becomes an **explicit registry**, not a reliance on runtime leniency:
+`ctx.waitUntil(p)` pushes `p` onto a per-request set; the handler wrapper closes the
+response stream (`responseStream.end()`), then `await`s that set, and only then resolves.
+Registration must happen before the handler returns — a promise registered from within
+already-detached work has nothing left to attach to. Semantics are preserved for every
+existing channel and for authored code, because every current caller registers
+synchronously during request handling.
+
+Two consequences to document, both real behavioral differences from Vercel:
+
+- **The drain is billed.** Post-ack work now counts against request duration and is bounded
+  by the 15-minute handler limit; on Vercel it was neither. A drain that would exceed the
+  limit is truncated with no completion signal, so `waitUntil` is for short best-effort work
+  — the delayed Slack acknowledgment, a metrics flush.
+- **It is not durable.** The registry survives nothing: a crash mid-drain loses the work
+  silently. Post-ack work that must survive — anything with an at-least-once requirement —
+  belongs in a durable invocation or a queue, not in `waitUntil`. Say so in the channel docs
+  alongside the existing `ctx.waitUntil(...)` promise, so authors pick the right tool rather
+  than discovering the distinction in production.
 
 ### 7. Payload ceilings, and start/delivery idempotency
 Async `Invoke` caps at **1 MB** — [raised from 256 KB in October 2025](https://aws.amazon.com/about-aws/whats-new/2025/10/aws-lambda-payload-size-256-kb-1-mb-invocations)
 — versus 6 MB sync. An earlier draft said 256 KB; the S3-offload conclusion stands, but any
-sizing analysis built on that number was wrong. Note the pricing edge: payloads above
+sizing analysis built on that number was wrong. Durable operations have their own published
+table (gap 2), and the two are not interchangeable: the driver→turn hop is a
+`CHAINED_INVOKE` at 1 MB, while `STEP`, `CONTEXT`, `WAIT`, and `CALLBACK` get 256 KB —
+so a step result is bounded four times tighter than the invoke that carries it.
+Note the pricing edge: payloads above
 256 KB bill an extra request per 64 KB chunk, so offloading is a cost decision as well as a
 limit one. `start()` carries serialized context including the bundle source descriptor and
 the initial delivery payload — use the same S3 pointer mechanism Fix A introduces for
@@ -459,7 +491,11 @@ Design the handoff explicitly in Phase 1:
 
 - **Track all three budgets** as first-class session state: operations (3,000), bytes (100 MB), **and wall-clock age**. The third is easy to forget — a durable execution is capped at **one year**, and a mostly-idle driver reaches that wall without approaching either of the other two. Schedule a rollover wake before the deadline rather than discovering it as a `TIMED_OUT` execution.
 - **Hand off to a successor execution** before either ceiling, at a turn boundary where state is quiescent.
-- **Transfer ownership atomically**: token index entries, inbox high-water `seq`, event-log cursor, and the snapshot pointer must all move to the successor in one step, or a delivery in flight during rollover is lost or double-processed. The DynamoDB session head record (Fix A) is the natural place to do this — a single conditional update on `fenceToken` both publishes the successor and fences the predecessor.
+- **Do not claim an atomic transfer — fence it instead.** Token-index entries, inbox high-water `seq`, event-log cursor, and the S3 snapshot pointer live in independent stores; no single write moves them together, and an earlier draft of this plan claimed otherwise. What *is* atomic is one conditional update to the DynamoDB session head (Fix A) that bumps `fenceToken` and names the successor — that is the serialization **point**, not the transfer itself. The protocol around it:
+  1. **Quiesce.** The predecessor stops at a turn boundary and writes its cursors — inbox high-water `seq`, event-log cursor, snapshot pointer — into the head record as the successor's starting frontier.
+  2. **Fence.** One conditional update on the expected `fenceToken` publishes the successor and invalidates the predecessor. From here every operation against *any* store — token index, inbox, event log, snapshot publish — must carry the current fence token and be rejected if stale, so a predecessor that wakes up late (a delayed retry, a slow callback) cannot write behind the successor's back. A fence that only guards the head record fences nothing.
+  3. **Reconcile before accepting deliveries.** The successor re-reads the published frontier, replays inbox entries above the recorded high-water mark, re-arms callbacks, and re-checks the token index for entries the predecessor wrote between quiesce and fence — *then* starts serving. A delivery in flight across the boundary is re-processed rather than lost.
+  Step 3 is only safe if deliveries are idempotent, which the event log's replay-idempotency scheme (Phase 1) already requires — this is the same invariant, load-bearing in a second place.
 - **Keep `sessionId` stable across rollovers.** It is the client-facing identity and the event-log partition key; only the execution behind it changes.
 
 Externalized snapshots make this handoff nearly free: the successor starts with
@@ -592,33 +628,73 @@ not an API key. Delete `src/internal/gateway.ts`, `src/internal/runtime-model.ts
 (`src/setup/{ai-gateway-api-key,validate-gateway-key,gateway-models}.ts`,
 `src/setup/boxes/{detect-ai-gateway,apply-ai-gateway-credential}.ts`); `WiringMode`
 in `src/setup/state.ts:101` collapses to a single mode.
-`DEFAULT_AGENT_MODEL_ID` → a **concrete** Bedrock inference-profile id, not a wildcard.
-Candidate: **the `us.` inference-profile form of the dated Sonnet 5 Converse id** — not the
-suffix-free `us.anthropic.claude-sonnet-5`. `@ai-sdk/amazon-bedrock` targets the
-Converse/InvokeModel runtime path, where Anthropic ids carry date-and-version suffixes
-(`…-v1:0`) and cross-region profiles are `us.`-prefixed versions of *those*; the suffix-free
-form belongs to Bedrock's newer Messages-API path, which the provider does not use. Pin the
-exact verified string before it lands. The `us.` prefix is a deliberate choice with
-consequences to document at the same time — `us.` is a *cross-Region* inference profile
-that may route requests to any US region, which is a data-residency decision, not just a
-routing detail. It also changes the IAM shape: the execution role needs
-`bedrock:InvokeModel` / `InvokeModelWithResponseStream` on the inference-profile ARN **and**
-on the underlying foundation-model ARNs in every region the profile can reach. Deployments
-with residency constraints should override to a single-region profile
-(`arn:aws:bedrock:<region>:<account>:inference-profile/...`) via `agent.ts`.
+**Decision: there is no default model id. Delete `DEFAULT_AGENT_MODEL_ID` as a fallback.**
+Earlier drafts of this plan argued over *which* Bedrock id to make the default. Wrong
+question — on Bedrock a framework-chosen model id is a guess about someone else's account,
+and it should be an authoring error to omit one.
+
+The deletion is small, because the implicit path is already narrow. `PublicAgentDefinition.model`
+is **required** (`src/shared/agent-definition.ts:276`), so any authored `agent.ts` declares a
+model today. The default has exactly one implicit consumer: `compileAgentConfig` substitutes
+`{ model: DEFAULT_AGENT_MODEL_ID }` when an agent directory has **no config module at all**
+(`src/compiler/normalize-agent-config.ts:40`). That branch becomes a compile error naming the
+agent and the field to add. Everything else the constant feeds is a *scaffold* value, not a
+runtime fallback, and stays:
+
+- `eve init` writes a literal id into the generated `agent.ts` (`src/cli/commands/init.ts:168,216`) — the result is explicit in authored source, which is the point.
+- The setup picker pre-selects one entry (`src/setup/boxes/select-model.ts:58,216`).
+
+Rename the constant to `INIT_SCAFFOLD_MODEL_ID` so the distinction is structural rather than
+conventional, and let `guard:invariants` keep it out of `src/compiler/` and `src/runtime/`.
+Removing an implicit default is a behavior break for a config-less agent directory →
+**`minor` changeset**, with the error message doing the migration work.
+
+Why this is more clearly right on Bedrock than it was on the Gateway: model access is
+**per-account opt-in and region-gated**, so a default names a model the account may not have
+enabled and fails at first inference rather than at build. The geo-profile choice is a
+**data-residency decision** that must never be made silently on an operator's behalf. And
+IAM grants must be scoped to the id actually in use — with no default, CDK derives
+`bedrock:InvokeModel` / `InvokeModelWithResponseStream` grants from the *authored* ids in the
+manifest instead of granting a guessed one.
+
+**What authors must then be told**, in docs and in the compile error. An earlier draft of
+this plan had the id shape backwards, so state it correctly. Anthropic dropped the dated
+`…-v1:0` suffix starting with Sonnet 4.6, so for Sonnet 5 the
+[model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html)
+publishes:
+
+- `anthropic.claude-sonnet-5` — the **base foundation-model id**, valid on both `InvokeModel`
+  and `Converse`. It is not a Messages-API-only id, and there is no dated Converse variant to
+  prefer over it. Stays in the calling region; forfeits cross-region capacity headroom.
+- `us.` / `eu.` / `au.` / `global.` `anthropic.claude-sonnet-5` — **geo inference profiles**
+  over that same model. Same API surface, different routing and residency: a geo profile may
+  route anywhere in its geography, and `global.` has no residency constraint at all.
+- `arn:aws:bedrock:<region>:<account>:inference-profile/...` — an application inference
+  profile, for single-region routing under a residency constraint.
+
+The choice also sets the IAM shape, which is why it belongs to the author rather than the
+framework: a geo profile needs grants on the profile ARN **and** on the underlying
+foundation-model ARNs in every region it can reach, while a bare model id needs only the
+single-region foundation-model ARN. Whatever `eve init` scaffolds must be verified against
+the model card **and** the vendored `@ai-sdk/amazon-bedrock` version at the moment it lands —
+provider releases lag new model ids, and a provider predating Sonnet 5 rejects it regardless
+of what Bedrock accepts.
 **`src/compiler/model-catalog.ts` needs a decision**: it fetches the Gateway catalog at
 build time to bake `contextWindowTokens`/`maxOutputTokens` into the manifest. Bedrock's
 `ListFoundationModels` does not reliably expose context windows — bake a static catalog
 and let `agent.ts` override.
 
-**Bedrock-as-default partly contradicts the credential-free local story.** The `local`
-durable backend needs no AWS credentials, but a Bedrock default means `eve dev` and local
-e2e need them for *every model call* — so "no AWS account required" is only true of the
-durable layer, not of running an agent. Resolve it explicitly: `@ai-sdk/anthropic` and
-`@ai-sdk/openai` are **already vendored**, so keep direct API-key providers as the
-first-class local path, and state what bare-string resolution does off-Lambda (recommended:
-resolve to Bedrock only when AWS credentials are present, otherwise require an explicit
-provider-qualified id and fail with a clear message rather than an opaque credential error).
+**Bare-string-resolves-to-Bedrock still partly contradicts the credential-free local story.**
+Dropping the default model id removes half of this tension — the framework no longer steers
+anyone onto Bedrock implicitly, and an author who wants a local API-key provider simply names
+one. What remains is bare-string resolution: the `local` durable backend needs no AWS
+credentials, but an id that resolves to Bedrock means `eve dev` and local e2e need them for
+*every model call*, so "no AWS account required" would be true of the durable layer and not
+of running an agent. Resolve it explicitly: `@ai-sdk/anthropic` and `@ai-sdk/openai` are
+**already vendored**, so keep direct API-key providers as the first-class local path, and
+state what bare-string resolution does off-Lambda (recommended: resolve to Bedrock only when
+AWS credentials are present, otherwise require an explicit provider-qualified id and fail
+with a clear message rather than an opaque credential error).
 
 ### Sandbox — Lambda MicroVM
 Maps cleanly onto the existing `SandboxBackend` interface
@@ -701,6 +777,34 @@ do not sign SigV4. **Decision: direct Lambda invoke with a synthesized event.** 
 consequence to carry forward: the unguessable-cron-path secret from `cron-handler-route.ts`
 is redundant under IAM auth and should be dropped rather than ported.
 
+**Spell out the IAM contract for that path.** Each schedule gets a CDK-created execution
+role with `lambda:InvokeFunction` on exactly the target function's **alias ARN** (not
+`$LATEST` — the versioning section pins the driver to an alias), trusted to
+`scheduler.amazonaws.com` and scoped with `aws:SourceArn` to the schedule's own ARN so the
+role cannot be assumed on behalf of a different schedule. Note what this path does *not*
+touch: Scheduler invokes the function directly, so it never crosses either HTTP surface —
+see the auth topology below, where EventBridge Scheduler is deliberately absent from both
+rows.
+
+**Idempotency needs a stated retry model, not just a stable key.** `(schedule ARN,
+scheduled time)` is stable across Scheduler's own retries — a failed target invocation is
+retried per the schedule's retry policy (`MaximumRetryAttempts`, optional DLQ) with the same
+scheduled time — so duplicates collapse onto one conditional write keyed on that pair. Lambda-side
+retries collapse onto the same key too: under async invocation, Lambda's two automatic
+retries replay the identical event payload, scheduled time included. Neither layer stamps an
+attempt number, so eve cannot distinguish a retry from a first attempt out of the event, and
+should not try to. The contract instead:
+
+- dispatch **claims** the run with a conditional write on `(scheduleArn, scheduledTime)`, committed in the same write that records the claim — first attempt wins, every later one fails the condition;
+- a handler that finds the key already claimed returns **success**, not error. Returning an error is precisely what drives another retry against a schedule that already ran;
+- if a first-versus-retry distinction is ever wanted (alerting, say), it comes from an eve-owned attempt counter on the claim record — never from the event.
+
+Pick the invocation type deliberately rather than inheriting a default: async hands eve
+Lambda-level retries it must absorb on top of Scheduler's, while sync (`RequestResponse`)
+keeps all retry behavior under the schedule's own policy and surfaces exhausted attempts to
+its DLQ. **Decision: sync invoke, Scheduler retry policy, DLQ** — one retry authority is
+worth more here than the fire-and-forget latency.
+
 ### Auth — needs two surfaces, and two interface changes
 An earlier draft proposed a single `AWS_IAM` Function URL with a `sigv4()` framework
 default. **That does not work** and the topology must be settled before implementation.
@@ -715,7 +819,11 @@ most of eve's inbound traffic.
 | Surface | Auth | Carries |
 |---|---|---|
 | Public (Function URL `NONE`, or API Gateway) | eve's own `routeAuth` chain — per-channel HMAC verification, `oidc()`, `jwtEcdsa()`, `httpBasic()` | browser clients, channel webhooks, OAuth callbacks |
-| Internal | `AWS_IAM` | agent→agent calls, EventBridge, internal invokes |
+| Internal | `AWS_IAM` | agent→agent calls, internal invokes |
+
+EventBridge Scheduler is deliberately in neither row: per the schedules section it invokes
+the function directly through its own execution role and never reaches eve over HTTP, so it
+is governed by that role's `lambda:InvokeFunction` grant rather than by either URL's auth.
 
 **WebSocket channels have no home in this topology.** `WS` is a public export
 (`src/public/definitions/channel.ts:28`), `ChannelRouteMethod` includes `"WEBSOCKET"`, and
@@ -828,9 +936,8 @@ while callbacks complete concurrently. The local-dev story stands.
 
 1. Can a callback be **raced against an in-flight step**, and what happens to the losing branch on replay? Gates *turn* cancel only — session terminate has `StopDurableExecution` behind it.
 2. **What does the parent observe when a per-turn child execution is stopped mid-flight?** The per-turn `context.invoke` design makes `StopDurableExecution` turn-granular, but the driver's checkpointed `invoke` operation sees *something* when its child is stopped — an error result, presumably. If the SDK retries a failed child invocation it would **resurrect a cancelled turn**, which is worse than not cancelling. Same feature as unknown 1; spike them together.
-3. What does a full session snapshot cost per step in checkpoint bytes? No longer gates *whether* to externalize — Fix A settles that structurally — but sizes the inline-vs-spill threshold for intra-turn step results, and calibrates how close a busy session gets to the 3,000-operation ceiling before rollover.
+3. **What does a full session snapshot cost per step, against which budget?** The service limits are documented — 256 KB per `STEP`, 1 MB per `CHAINED_INVOKE`, 100 MB and 3,000 operations per execution (gap 2) — so this no longer gates *whether* to externalize, and it is not a hunt for an unpublished ceiling. What is unmeasured is how much of each budget the durable SDK's own envelope consumes before eve's bytes: that sets the inline-vs-spill threshold for intra-turn step results and calibrates how close a busy session gets to the operation ceiling before rollover.
 4. **How is the stream attempt id allocated?** `StepContext` does not expose the retry attempt, so the generation-aware cursor (gap 2) needs an eve-owned scheme. On the critical path for the client protocol change.
-5. **What is the actual payload ceiling on durable `context.invoke()`?** AWS documents 1 MB for ordinary async `Invoke` but describes `context.invoke()` as a distinct backend operation without publishing its limit. Externalization (Fix A) is right regardless, but the driver→turn contract should be sized against a measured number, not an inherited one.
 
 **Phase 1 needs a real AWS gate, not just the local backend.** The CDK stack is scheduled in
 Phase 4, but the local runner cannot validate IAM, service quotas, callback races, alias
@@ -843,11 +950,13 @@ is how integration failures get discovered in Phase 4.
 
 **Plus one cheap smoke test, deliberately not struck off.** The Nitro docs say the
 `aws-lambda` preset supports `awsLambda: { streaming: true }` over
-`awslambda.streamifyResponse`, and that is almost certainly right — but gap 6's entire
-`waitUntil` design rests on the handler continuing to execute *after* the response stream
-closes, which no doc actually promises. Half a day deploying a trivial streaming handler to
-a real Function URL and asserting post-close execution is cheap insurance against building
-a public API semantic on an assumption.
+`awslambda.streamifyResponse`, and that is almost certainly right — but gap 6's `waitUntil`
+registry needs the *awaited* case confirmed on a real Function URL: that work explicitly
+awaited after `responseStream.end()` still completes, that the client has already received
+the full response by then, and that the drain counts against billed duration as expected.
+Half a day on a trivial streaming handler is cheap insurance for a public API semantic. Note
+what this smoke test is *not* checking any more: whether Lambda implicitly drains unawaited
+promises. It does not, that is documented, and gap 6 no longer depends on it.
 
 Then define the `DurableBackend` seam and land the **`local` backend first** — it keeps
 `eve dev` and the test tiers working throughout the rewrite, and it is the cheapest place
@@ -869,7 +978,7 @@ their docs in the same PRs:
 - [ ] Durable inbox: transactional seq+dedupe, drain protocol, generational callbacks — for **all four** reusable hook families (gap 1)
 - [ ] Ingress idempotency contract — `RunInput`/`DeliverInput` changes, client UUID on the wire, provider-event-id plumbing through every channel adapter (gap 7)
 - [ ] Session reservation state machine (`RESERVED`→`STARTING`→`ACTIVE`) with sweep/recovery and DLQ reconciliation
-- [ ] Driver rollover: operations, bytes, **and age** budgets, plus atomic handoff via the session head record
+- [ ] Driver rollover: operations, bytes, **and age** budgets, plus fenced handoff — quiesce, one conditional `fenceToken` bump on the session head, successor reconciles before serving
 - [ ] Serde ownership decision + type-fidelity test
 - [ ] AWS service-call layer (SigV4-over-`fetch` vs vendored clients) and off-Lambda credential resolution
 - [ ] Event-log batching policy — sets client-perceived token cadence
@@ -914,7 +1023,7 @@ e2e workflow.
   - **A type-fidelity round-trip** over the snapshot (`Date`, `Map`, `Set`, `Buffer`, URL `FilePart.data`) to catch serde degradation.
 
   Then `eve dev` end-to-end against `apps/fixtures/weather-agent`, driving a real multi-turn conversation and confirming events stream and a HITL approval round-trips.
-- **Phase 2:** run an agent against a real Bedrock model id; confirm the compiled manifest carries correct context-window limits and that compaction triggers at the right threshold.
+- **Phase 2:** run an agent against a real Bedrock model id; confirm the compiled manifest carries correct context-window limits and that compaction triggers at the right threshold. Also assert the **absence** of a default: an agent directory with no config module must fail the build with a message naming the agent and the `model` field, not silently compile against a framework-chosen id.
 - **Phase 3:** `e2e/fixtures/agent-tools-sandbox` locally against Docker, then a deployed MicroVM: create a session, write a file, let it idle into suspend, resume **within the 8-hour cap**, confirm the file survived. Then the case that actually matters — force expiry past the cap and confirm **cold rehydrate** recreates the sandbox and re-seeds files rather than erroring.
 - **Phase 4/5:** deploy the CDK stack to a test account and run `eve eval` against the Function URL — the same shape as today's `e2e-vercel.yml`, different target.
 

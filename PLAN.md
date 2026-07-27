@@ -98,10 +98,18 @@ Client ── Function URL ─► HTTP Lambda (Nitro, aws-lambda preset)
                                                Bedrock (models)
 ```
 
-**Default topology: two Lambda bundles** from one compiled artifact set — the HTTP handler
-and the durable handler — instead of Vercel's N-functions-per-workflow. If route isolation
-(see Auth) is implemented as separate handler entries rather than a surface-tagged
-allowlist, that becomes three; the allowlist is the default precisely to keep it at two.
+**Default topology: two bundles, three function resources** — all from one compiled artifact
+set, instead of Vercel's N-functions-per-workflow.
+
+| Bundle | Function resources |
+|---|---|
+| HTTP handler (Nitro) | one, fronted by both the public and IAM surfaces via a surface-tagged route allowlist |
+| Durable handler | **two** — driver and turn — deployed as distinct resources from the same bundle |
+
+The driver/turn split is not cosmetic: it avoids a Lambda-invoking-itself cycle and the
+recursion detector that halts such chains (see the versioning section). Route isolation uses
+the allowlist rather than separate handler entries specifically to keep the HTTP side at one
+resource.
 
 ---
 
@@ -133,7 +141,7 @@ missing mapping does not fix this — the semantics are simply different.
 - **Dedupe must live in that transaction, not in a condition expression on the item.** With `(sessionId, seq)` as the primary key, a `ConditionExpression` on non-key `deliveryId` evaluates only the item being written — DynamoDB cannot enforce uniqueness across a partition. A retried delivery would get a *new* `seq` and pass.
 - After enqueuing, `deliver()` completes the current wake-up callback. A completion that loses a race is harmless: the message is already durable in the inbox.
 - **Drain protocol** ("atomically drains" is not a DynamoDB primitive, so specify it): `Query` the session partition above the last-processed `seq` in order, process, then record the high-water `seq` in the checkpoint. **Do not delete-then-checkpoint**: DynamoDB and the checkpoint log are separate systems, so a failure between them either loses deliveries (deleted, never checkpointed) or strands them (checkpointed, never cleaned). Treat inbox items as **immutable until the checkpoint commits**, then garbage-collect below the checkpointed high-water mark — ideally via TTL, so cleanup needs no second write path.
-- **Arm the next callback *before* the final empty check — otherwise deliveries are lost forever.** An earlier draft said mid-drain arrivals "wake the next callback," which is wrong: between the callback that woke the execution being consumed and a fresh one being armed, **no callback exists**. A delivery landing in that window writes to the inbox, finds nothing to signal, and parks indefinitely — the execution has already decided the inbox is empty and suspended. Correct sequence: arm a **generation-stamped** callback first, then re-`Query` above the high-water mark, then conditionally publish that generation. The re-query after arming is what closes the window.
+- **Arm the next callback *before* the final empty check — otherwise deliveries are lost forever.** An earlier draft said mid-drain arrivals "wake the next callback," which is wrong: between the callback that woke the execution being consumed and a fresh one being armed, **no callback exists**. A delivery landing in that window writes to the inbox, finds nothing to signal, and parks indefinitely — the execution has already decided the inbox is empty and suspended. Correct sequence: arm a **generation-stamped** callback first, then re-`Query` above the high-water mark, then conditionally publish that generation. The re-query is what closes the window — **but only with `ConsistentRead: true` against the base table.** A default eventually-consistent read can miss a delivery committed just before the callback was armed, reopening the exact race the re-query exists to close; and a GSI cannot provide strong consistency at all, so this query must not be served from an index. Test it with artificially delayed read visibility across the arm/re-query window — it will not surface at normal latencies.
 - The token index (`token → {callbackId, executionId, ttl}`) still exists, but only to find the *current* wake-up callback — losing the race to a stale one no longer loses a message.
 
 Use **`waitForCallback(name, submitter, config)`** rather than raw `createCallback()`: the
@@ -145,7 +153,7 @@ is the expensive option:
 
 | Token family | Semantics | Mapping |
 |---|---|---|
-| Session delivery (public hook, rekeyed) | reusable, multi-message, ordered | durable inbox |
+| Session delivery (public hook, **rekeyable**) | reusable, multi-message, ordered | durable inbox + an explicit rekey protocol — see below |
 | Session **auth** (`{sessionId}:auth`, `workflow-entry.ts:166`) | **reusable iterator** — created before any turn so OAuth callbacks can resume repeatedly | durable inbox |
 | **Turn inbox** (`{completionToken}:inbox`, `turn-workflow.ts:65`) | **reusable iterator** with a durable cursor shared between promise and iterator reads | durable inbox, per turn execution |
 | **Turn control** (`turn-control-receiver.ts:27`) | **reusable iterator**, multi-message control channel | durable inbox or explicit redesign |
@@ -159,6 +167,17 @@ must be mapped onto a durable inbox with generational callbacks, or explicitly r
 out — and `turn-control-receiver.ts` deserves scrutiny for the latter, since its
 buffered-delivery coupling to the delivery hook is exactly the kind of shared-cursor
 protocol that does not survive the port unchanged.
+
+**Continuation-token rekeying is a documented public semantic and needs a port.** `rekey()`
+(`session-delivery-hook.ts:179`) is not a rename — `docs/channels/custom.mdx:312` promises
+specific behavior: *"the runtime claims the new park hook before releasing the old token. If
+another active session already owns the new token, the re-keying session fails instead of
+taking it over. After a successful re-key, inbound deliveries still addressed to the old
+token are dropped."* Reproduce each clause explicitly: a **conditional claim** on the new
+token (failing, not stealing, when owned), a **dual-drain window** where both tokens feed
+one inbox, a defined **conflict result** surfaced to the caller, and an **old-token
+cutoff** after which deliveries are dropped rather than parked. Getting the ordering wrong
+here loses messages precisely when a channel is migrating a conversation.
 
 **The token index needs two lifetimes.** `Runtime.resolveSession(continuationToken)`
 (`workflow-runtime.ts:229`) resolves token → sessionId via `getHookByToken`, and it must
@@ -254,6 +273,23 @@ reconstruct state, turning a ~50 ms resume into tens of seconds. The standard fi
 periodic compacted snapshots — *is* the design above, with a delta log bolted on. Note also
 that JSONL-versus-snapshot is irrelevant to both ceilings: any externalization gets the
 same relief.
+
+**Every store needs a stated lifecycle — not just the inbox.** "Unreferenced objects are
+garbage" is not a retention policy, and the design now spans five stores with no cleanup
+story between them. Specify each, because the wrong answer is discovered as either an
+unbounded bill or a compliance finding:
+
+| Store | Lifecycle question |
+|---|---|
+| Inbox items | TTL below the checkpointed high-water mark |
+| Dedupe / tombstone records | must outlive the **longest provider retry window** (Slack, GitHub, Stripe all differ) — too short reopens duplicate delivery |
+| Event batches | stream retention after a session goes terminal; how long can a client still reconnect and tail? |
+| Token mappings | cleared on terminal session, but only after the old-token cutoff (rekey) |
+| Snapshots + unreferenced S3 objects | S3 lifecycle rules, plus periodic reconciliation against the session head to sweep objects a failed publish orphaned |
+
+Terminal-session retention is the cross-cutting one: decide how long a completed session's
+data survives for debugging and audit, and make it a single configurable rather than five
+independent constants.
 
 **Replay invariant to hold:** rehydrate only the **frontier** snapshot — one GET at resume,
 O(1). The SDK replays from the beginning on every wake, so dereferencing a pointer at every
@@ -471,11 +507,29 @@ continue with their original version."* A single long-lived durable execution is
 start, so a days-long session would run stale code forever.
 
 Keep the behavior by dispatching **each turn as its own durable invocation through the
-alias** — `context.invoke(name, aliasArn, payload)` chained from the driver, which
+alias** — `context.invoke(name, targetArn, payload)` chained from the driver, which
 checkpoints the result and resumes without re-invoking. New turns then pick up new
-deployments while the driver stays pinned, matching today's semantics. `StopDurableExecution`
-also becomes per-turn granular, which is a bonus for turn cancel. If this is not done, the
-regression must be stated explicitly rather than left implicit.
+deployments while the driver stays pinned, matching today's semantics. If this is not done,
+the regression must be stated explicitly rather than left implicit.
+
+**Deploy the driver and turn handlers as separate Lambda *resources* from the same
+artifact.** As drawn, the driver would invoke its own alias once per turn — a
+Lambda-invoking-Lambda cycle, and Lambda's **recursion detection** halts such chains at
+roughly 16 invocations. Whether that applies to backend-mediated durable `context.invoke`
+is genuinely unclear, so do not leave it to chance: two distinct function resources from one
+bundle sidesteps the question entirely at no real cost. If same-function chaining is
+preferred anyway, it becomes a **Phase 1 acceptance gate** — run ≥20 turns in one session
+under default recursion settings before the design is locked.
+
+**Per-turn `StopDurableExecution` needs a child-identity path that does not exist yet.**
+`context.invoke()` returns the child's result or throws; it does **not** surface the child's
+execution ARN, and `StopDurableExecution` requires exactly that ARN. So "cancellation
+becomes per-turn granular" is not free. Two options: keep turn cancel **callback-only**
+(consistent with gap 3, and the simpler choice), or have the child **self-register** its own
+ARN under a fenced `(sessionId, turnId)` key on first checkpoint so the HTTP side can look
+it up. If self-registration is chosen, the parent must also handle the stopped child's
+`InvokeError` **without retrying it** — otherwise the SDK's retry resurrects the turn that
+was just cancelled, which is the failure mode spike 2 exists to catch.
 
 **But the driver cannot live forever — it needs a rollover strategy.** A single durable
 execution is hard-capped at **3,000 operations** and **100 MB of cumulative persisted data**
@@ -657,6 +711,17 @@ IAM grants must be scoped to the id actually in use — with no default, CDK der
 `bedrock:InvokeModel` / `InvokeModelWithResponseStream` grants from the *authored* ids in the
 manifest instead of granting a guessed one.
 
+**Manifest-derived grants collide with dynamic model selection**, though, and the plan must
+say which way that resolves. `AgentModelResolver` (`src/shared/agent-definition.ts:75`) lets
+an agent return *any* model at runtime — a handle the manifest never saw — so least-privilege
+IAM derived from authored ids will deny it at first inference. Pick one and document it:
+require dynamic definitions to declare a **finite model allowlist** that feeds the grant
+(recommended — keeps least privilege and fails at compile rather than at inference), reject
+undeclared selections at runtime with a clear error, or document that dynamic selection
+requires a deliberately broader grant. Silently deriving grants from authored ids while
+advertising dynamic selection produces a runtime `AccessDeniedException` that looks like a
+Bedrock outage.
+
 **What authors must then be told**, in docs and in the compile error. An earlier draft of
 this plan had the id shape backwards, so state it correctly. Anthropic dropped the dated
 `…-v1:0` suffix starting with Sonnet 4.6, so for Sonnet 5 the
@@ -799,11 +864,19 @@ should not try to. The contract instead:
 - a handler that finds the key already claimed returns **success**, not error. Returning an error is precisely what drives another retry against a schedule that already ran;
 - if a first-versus-retry distinction is ever wanted (alerting, say), it comes from an eve-owned attempt counter on the claim record — never from the event.
 
-Pick the invocation type deliberately rather than inheriting a default: async hands eve
-Lambda-level retries it must absorb on top of Scheduler's, while sync (`RequestResponse`)
-keeps all retry behavior under the schedule's own policy and surfaces exhausted attempts to
-its DLQ. **Decision: sync invoke, Scheduler retry policy, DLQ** — one retry authority is
-worth more here than the fire-and-forget latency.
+**Invocation type: async — and an earlier draft got this backwards.** It reasoned that sync
+(`RequestResponse`) would keep retry authority with Scheduler and surface exhausted attempts
+to its DLQ. It does not. A synchronous invoke whose *handler* fails still returns **HTTP
+200** with the failure reported in the `FunctionError` field — so Scheduler sees a
+successful target call and will neither retry nor DLQ it. Sync invocation would silently
+discard exactly the failures the retry policy exists to catch, which is worse than either
+alternative. Async is also the normal shape for Scheduler Lambda targets.
+
+**Decision: async invoke**, absorbing Lambda's own retry semantics on top of Scheduler's —
+which the claim protocol above already makes safe, since duplicate attempts collapse on the
+`(scheduleArn, scheduledTime)` conditional write. If a single retry authority is genuinely
+wanted later, the only way to get it is a target whose *API call itself* fails on dispatch
+failure (SQS between Scheduler and the handler, for instance) — not a sync Lambda invoke.
 
 ### Auth — needs two surfaces, and two interface changes
 An earlier draft proposed a single `AWS_IAM` Function URL with a `sigv4()` framework
@@ -966,9 +1039,18 @@ in this phase is spike 3's call, not a given (gap 2, Fix A).
 Build the event log with an explicit replay-idempotency scheme, and the hook-token index
 with a park/retry policy for the deliver-before-mapping race. Rewrite `workflow-entry.ts` /
 `turn-workflow.ts` / `workflow-steps.ts` against `DurableContext`, keeping
-`workflow-runtime.ts`'s `Runtime` interface fixed so channels and the harness are
-untouched. Delete `src/internal/workflow-bundle/` and `src/internal/workflow/`. Add the
-`aws` backend last.
+`workflow-runtime.ts`'s `Runtime` interface fixed. Delete `src/internal/workflow-bundle/`
+and `src/internal/workflow/`. Add the `aws` backend last.
+
+> **"Channels and the harness are untouched" is only true of the `Runtime` interface, not of
+> the migration.** An earlier draft overstated this. The stream-retraction decision (gap 2)
+> reaches every consumer of the event stream: wire-level retraction requires each UI and
+> channel adapter to *reverse output it has already emitted* — a Slack message already
+> posted, a rendered token already shown — and buffer-until-checkpoint removes token
+> streaming outright. Whichever semantic is chosen, scope it across the clients
+> (`src/client`, `react`/`vue`/`svelte`), all eight `waitUntil`-using channel adapters, the
+> protocol docs, and compatibility tests. Pick it **before** implementation starts; it is
+> not a detail that can be retrofitted after the runtime lands.
 
 **Phase 1 is not done until all of these land** — several are assigned to Phase 1 elsewhere
 in this document but are easy to lose, and most are public surface, so `AGENTS.md` requires
@@ -982,7 +1064,8 @@ their docs in the same PRs:
 - [ ] Serde ownership decision + type-fidelity test
 - [ ] AWS service-call layer (SigV4-over-`fetch` vs vendored clients) and off-Lambda credential resolution
 - [ ] Event-log batching policy — sets client-perceived token cadence
-- [ ] Stream protocol: generation-aware cursor **and** the chosen retraction semantics
+- [ ] Stream protocol: generation-aware cursor **and** the chosen retraction semantics, scoped across clients, channel adapters, protocol docs, and compatibility tests
+- [ ] Retention and orphan-reconciliation policy across all five stores
 
 Everything downstream depends on this; nothing else should start until the `Runtime`
 interface is proven against the local backend.
